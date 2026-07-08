@@ -199,6 +199,15 @@ async function idbGetMeta(key) {
 }
 
 const SPRING = "cubic-bezier(0.32, 0.72, 0, 1)";
+const ACCENTS = [
+  { name: "Ruby", hex: "#FA2D48" },
+  { name: "Amber", hex: "#FF9F0A" },
+  { name: "Citrine", hex: "#FFD60A" },
+  { name: "Emerald", hex: "#30D158" },
+  { name: "Azure", hex: "#0A84FF" },
+  { name: "Violet", hex: "#BF5AF2" },
+  { name: "Rose", hex: "#FF375F" },
+];
 
 // =====================================================================
 export default function MusicPlayer() {
@@ -250,6 +259,13 @@ export default function MusicPlayer() {
   const [dragOver, setDragOver] = useState(false);
   const [rowDragIdx, setRowDragIdx] = useState(null);
 
+  // ---- Vinyl Mode: full-screen spinning-record experience ----
+  const [vinylMode, setVinylMode] = useState(false);
+  const [accentIdx, setAccentIdx] = useState(0);
+  const [crackleOn, setCrackleOn] = useState(false);
+  const [vinylSwipeX, setVinylSwipeX] = useState(0);
+  const [wakeLockActive, setWakeLockActive] = useState(false);
+
   const audioRef = useRef(null);
   const fileInputRef = useRef(null);
   const vuCanvasRef = useRef(null);
@@ -269,6 +285,10 @@ export default function MusicPlayer() {
   const toastTimer = useRef(null);
   const resumeSeekRef = useRef(null);
   const lastSaveRef = useRef(0);
+  const wakeLockRef = useRef(null);
+  const noiseGainRef = useRef(null);
+  const noiseSourceRef = useRef(null);
+  const vinylTouchStartX = useRef(0);
 
   const currentTrack = library.find((t) => t.id === queue[queueIndex]) || null;
   const activePlaylist = playlists.find((p) => p.id === openPlaylistId) || null;
@@ -301,6 +321,16 @@ export default function MusicPlayer() {
   useEffect(() => { if (loaded) idbSetMeta("playCounts", playCounts); }, [playCounts, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("recentlyPlayed", recentlyPlayed); }, [recentlyPlayed, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("positions", positions); }, [positions, loaded]);
+
+  // launched from the "Vinyl Mode" home-screen shortcut — jump straight in once a track is ready
+  useEffect(() => {
+    if (!loaded) return;
+    const wantsVinyl = new URLSearchParams(window.location.search).get("vinyl") === "1";
+    if (!wantsVinyl) return;
+    if (currentTrack) { setVinylMode(true); }
+    else if (library.length) { playFrom(library, 0, "Library"); setVinylMode(true); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
 
   // ------------------------------------------------------------------
   // smart / computed lists
@@ -344,6 +374,65 @@ export default function MusicPlayer() {
     if (mid) mid.gain.value = eqBands.mid;
     if (treble) treble.gain.value = eqBands.treble;
   }, [eqBands]);
+
+  // ------------------------------------------------------------------
+  // WOW — synthesized vinyl crackle/hiss ambiance (generated noise, loops forever,
+  // mixed in on its own gain node so it's independent of the EQ/master chain)
+  // ------------------------------------------------------------------
+  const ensureNoiseGraph = useCallback(() => {
+    if (!audioCtxRef.current || noiseSourceRef.current) return;
+    const ctx = audioCtxRef.current;
+    const bufSize = ctx.sampleRate * 2;
+    const buffer = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    let lastOut = 0;
+    for (let i = 0; i < bufSize; i++) {
+      const white = Math.random() * 2 - 1;
+      // gentle low-pass + occasional pop for a warmer "vinyl" texture vs raw static
+      lastOut = (lastOut + 0.04 * white) / 1.04;
+      data[i] = lastOut * 4 + (Math.random() < 0.0006 ? (Math.random() * 2 - 1) * 0.6 : 0);
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buffer; src.loop = true;
+    const filter = ctx.createBiquadFilter(); filter.type = "highpass"; filter.frequency.value = 500;
+    const gain = ctx.createGain(); gain.gain.value = 0;
+    src.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
+    src.start();
+    noiseSourceRef.current = src; noiseGainRef.current = gain;
+  }, []);
+
+  useEffect(() => {
+    if (crackleOn) { ensureAudioGraph(); ensureNoiseGraph(); }
+    const g = noiseGainRef.current, ctx = audioCtxRef.current;
+    if (!g || !ctx) return;
+    const now = ctx.currentTime;
+    g.gain.cancelScheduledValues(now);
+    g.gain.setValueAtTime(g.gain.value, now);
+    g.gain.linearRampToValueAtTime(crackleOn && isPlaying ? 0.05 : 0, now + 0.4);
+  }, [crackleOn, isPlaying, ensureAudioGraph, ensureNoiseGraph]);
+
+  // ------------------------------------------------------------------
+  // WOW — Screen Wake Lock while Vinyl Mode is open, so the record keeps
+  // spinning on screen instead of the phone locking mid-play.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    let cancelled = false;
+    const acquire = async () => {
+      if (!("wakeLock" in navigator) || !vinylMode) return;
+      try {
+        const lock = await navigator.wakeLock.request("screen");
+        if (cancelled) { lock.release(); return; }
+        wakeLockRef.current = lock;
+        setWakeLockActive(true);
+        lock.addEventListener("release", () => setWakeLockActive(false));
+      } catch { setWakeLockActive(false); }
+    };
+    if (vinylMode) acquire();
+    else { wakeLockRef.current?.release?.(); wakeLockRef.current = null; setWakeLockActive(false); }
+    const onVisible = () => { if (document.visibilityState === "visible" && vinylMode) acquire(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { cancelled = true; document.removeEventListener("visibilitychange", onVisible); };
+  }, [vinylMode]);
 
   const fadeTo = (target, ms) => {
     const g = masterGainRef.current, ctx = audioCtxRef.current;
@@ -645,8 +734,22 @@ export default function MusicPlayer() {
     navigator.mediaSession.setActionHandler("previoustrack", () => stepTrack(-1));
     navigator.mediaSession.setActionHandler("nexttrack", () => stepTrack(1));
     navigator.mediaSession.setActionHandler("seekto", (d) => { if (d.seekTime != null) seekTo(d.seekTime); });
+    navigator.mediaSession.setActionHandler("stop", () => { if (audioRef.current) audioRef.current.pause(); setIsPlaying(false); });
+    try {
+      navigator.mediaSession.setActionHandler("seekbackward", (d) => seekTo(currentTime - (d.seekOffset || 10)));
+      navigator.mediaSession.setActionHandler("seekforward", (d) => seekTo(currentTime + (d.seekOffset || 10)));
+    } catch { /* not supported everywhere */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queue, queueIndex, shuffle, repeatMode, isPlaying, duration]);
+
+  // keeps the OS lock-screen / notification scrubber in sync with playback
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || !("setPositionState" in navigator.mediaSession)) return;
+    if (!duration || !isFinite(duration)) return;
+    try {
+      navigator.mediaSession.setPositionState({ duration, playbackRate: 1, position: Math.min(currentTime, duration) });
+    } catch { /* ignore transient state errors */ }
+  }, [currentTime, duration]);
 
   // ------------------------------------------------------------------
   // sleep timer — WOW #5: fades out over the last stretch instead of a hard cut
@@ -729,6 +832,16 @@ export default function MusicPlayer() {
     setArtSwipeX(0);
   };
 
+  // ---- Vinyl Mode gestures: tap record to play/pause, swipe to skip ----
+  const onVinylTouchStart = (e) => { vinylTouchStartX.current = e.touches[0].clientX; };
+  const onVinylTouchMove = (e) => { setVinylSwipeX(e.touches[0].clientX - vinylTouchStartX.current); };
+  const onVinylTouchEnd = () => {
+    if (vinylSwipeX < -60) { stepTrack(1); if (navigator.vibrate) navigator.vibrate(15); }
+    else if (vinylSwipeX > 60) { stepTrack(-1); if (navigator.vibrate) navigator.vibrate(15); }
+    setVinylSwipeX(0);
+  };
+  const onVinylTap = () => { togglePlay(); if (navigator.vibrate) navigator.vibrate(isPlaying ? 8 : [8, 30, 8]); };
+
   // ------------------------------------------------------------------
   const q = searchQuery.trim().toLowerCase();
   const searchLibraryResults = q ? library.filter((t) => t.name.toLowerCase().includes(q)) : [];
@@ -759,6 +872,7 @@ export default function MusicPlayer() {
         .hscroll > * { scroll-snap-align: start; }
         .fade-in { animation: fadeIn 0.2s ease-out; }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes vinylSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
       `}</style>
 
       {toast && (
@@ -988,11 +1102,12 @@ export default function MusicPlayer() {
                   <input type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} onChange={onVolumeChange} className="flex-1" />
                 </div>
 
-                <div className="flex items-center gap-10 pb-2">
-                  <button onClick={() => setNpView("lyrics")} className="press flex flex-col items-center gap-1" style={{ color: "#98989D" }}><Mic2 size={18} /><span className="text-[10px]">Lyrics</span></button>
-                  <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); }} className="press flex flex-col items-center gap-1" style={{ color: sleepEndsAt ? "#FA2D48" : "#98989D" }}><Moon size={18} /><span className="text-[10px]">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
-                  <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); }} className="press flex flex-col items-center gap-1" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? "#FA2D48" : "#98989D" }}><SlidersHorizontal size={18} /><span className="text-[10px]">EQ</span></button>
-                  <button onClick={() => setNpView("queue")} className="press flex flex-col items-center gap-1" style={{ color: "#98989D" }}><ListMusic size={18} /><span className="text-[10px]">Up Next</span></button>
+                <div className="flex items-center gap-8 pb-2 overflow-x-auto hscroll" style={{ paddingLeft: 4, paddingRight: 4 }}>
+                  <button onClick={() => setVinylMode(true)} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: "#98989D" }}><Disc3 size={18} /><span className="text-[10px]">Vinyl Mode</span></button>
+                  <button onClick={() => setNpView("lyrics")} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: "#98989D" }}><Mic2 size={18} /><span className="text-[10px]">Lyrics</span></button>
+                  <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); }} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: sleepEndsAt ? "#FA2D48" : "#98989D" }}><Moon size={18} /><span className="text-[10px]">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
+                  <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); }} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? "#FA2D48" : "#98989D" }}><SlidersHorizontal size={18} /><span className="text-[10px]">EQ</span></button>
+                  <button onClick={() => setNpView("queue")} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: "#98989D" }}><ListMusic size={18} /><span className="text-[10px]">Up Next</span></button>
                 </div>
 
                 {showEq && (
@@ -1046,6 +1161,98 @@ export default function MusicPlayer() {
           </div>
         </div>
       )}
+
+      {vinylMode && currentTrack && (() => {
+        const accent = ACCENTS[accentIdx].hex;
+        return (
+          <div className="fade-in absolute inset-0 flex flex-col overflow-hidden select-none" style={{ zIndex: 90, background: "#000000" }}>
+            <div className="absolute inset-0" style={{ background: artGradient(currentTrack.name), filter: "blur(110px)", opacity: 0.4 }} />
+            <div className="absolute inset-0" style={{ background: `radial-gradient(circle at 50% 15%, ${accent}22, transparent 60%)` }} />
+            <div className="absolute inset-0" style={{ background: "linear-gradient(180deg, rgba(0,0,0,0.35), rgba(0,0,0,0.75) 70%, #000 100%)" }} />
+
+            <div className="relative flex items-center justify-between px-5 shrink-0" style={{ height: 54 }}>
+              <button onClick={() => setVinylMode(false)} className="press p-1.5 rounded-full" style={{ background: "rgba(255,255,255,0.1)" }}><ChevronDown size={20} /></button>
+              <div className="flex items-center gap-1.5 text-[10px] tracking-wider" style={{ color: wakeLockActive ? accent : "#5A5A5C" }}>
+                <div className="w-1.5 h-1.5 rounded-full" style={{ background: wakeLockActive ? accent : "#5A5A5C" }} />
+                {wakeLockActive ? "SCREEN AWAKE" : "VINYL MODE"}
+              </div>
+              <button onClick={() => setCrackleOn((c) => !c)} className="press px-2.5 py-1.5 rounded-full text-[10px] font-semibold" style={{ background: crackleOn ? accent : "rgba(255,255,255,0.1)", color: crackleOn ? "#000" : "#FFFFFF" }}>
+                CRACKLE
+              </button>
+            </div>
+
+            <div className="relative flex-1 flex flex-col items-center justify-center gap-8 px-6"
+              onTouchStart={onVinylTouchStart} onTouchMove={onVinylTouchMove} onTouchEnd={onVinylTouchEnd}>
+              <div
+                className="relative"
+                style={{ width: "min(78vw, 320px)", aspectRatio: "1 / 1", transform: `translateX(${vinylSwipeX}px)`, transition: vinylSwipeX === 0 ? `transform 0.3s ${SPRING}` : "none" }}
+              >
+                {/* tonearm */}
+                <div style={{
+                  position: "absolute", top: "-8%", right: "-14%", width: "55%", height: "55%",
+                  transformOrigin: "82% 12%",
+                  transform: isPlaying ? "rotate(24deg)" : "rotate(-8deg)",
+                  transition: `transform 0.7s ${SPRING}`, zIndex: 5,
+                }}>
+                  <div style={{ position: "absolute", top: "10%", left: "48%", width: "6%", paddingBottom: "78%", background: "linear-gradient(180deg,#d8d8dc,#8a8a8e)", borderRadius: 6 }} />
+                  <div style={{ position: "absolute", top: "6%", left: "40%", width: "20%", height: "10%", background: "#c8c8cc", borderRadius: 4, boxShadow: "0 2px 6px rgba(0,0,0,0.4)" }} />
+                  <div style={{ position: "absolute", bottom: "10%", left: "34%", width: "20%", height: "14%", background: "#1c1c1e", borderRadius: 3, boxShadow: "0 2px 6px rgba(0,0,0,0.5)" }} />
+                </div>
+
+                {/* record */}
+                <button onClick={onVinylTap} aria-label="Toggle play"
+                  className="absolute inset-0 rounded-full"
+                  style={{
+                    background: "repeating-radial-gradient(circle at center, #1a1a1a 0px, #1a1a1a 2px, #0c0c0c 3px, #0c0c0c 5px)",
+                    boxShadow: `0 25px 70px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.06)`,
+                    animation: "vinylSpin 3.2s linear infinite",
+                    animationPlayState: isPlaying ? "running" : "paused",
+                  }}
+                >
+                  <div className="absolute rounded-full flex items-center justify-center overflow-hidden" style={{ inset: "30%", boxShadow: "0 0 0 2px rgba(0,0,0,0.4)" }}>
+                    {currentTrack.artUrl ? (
+                      <img src={currentTrack.artUrl} alt="" className="w-full h-full object-cover" />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center" style={{ background: artGradient(currentTrack.name) }}>
+                        <Disc3 size={30} color="rgba(255,255,255,0.5)" />
+                      </div>
+                    )}
+                  </div>
+                  <div className="absolute rounded-full" style={{ inset: "48.5%", background: "#050505", boxShadow: "inset 0 0 3px rgba(255,255,255,0.4)" }} />
+                </button>
+              </div>
+
+              <div className="text-center w-full max-w-xs">
+                <div className="text-lg font-bold truncate">{currentTrack.name}</div>
+                <div className="text-xs mt-1" style={{ color: "#98989D" }}>{queueSource} · {currentTrack.ext}</div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {ACCENTS.map((a, i) => (
+                  <button key={a.name} onClick={() => setAccentIdx(i)} className="press rounded-full" style={{ width: i === accentIdx ? 20 : 14, height: i === accentIdx ? 20 : 14, background: a.hex, boxShadow: i === accentIdx ? `0 0 0 2px #000, 0 0 0 3px ${a.hex}` : "none", transition: `all 0.2s ${SPRING}` }} aria-label={a.name} />
+                ))}
+              </div>
+
+              <div className="flex items-center gap-7">
+                <button onClick={() => stepTrack(-1)} className="press"><SkipBack size={26} fill="#FFFFFF" /></button>
+                <button onClick={togglePlay} className="press w-16 h-16 rounded-full flex items-center justify-center" style={{ background: accent }}>
+                  {isPlaying ? <Pause size={26} color="#000000" fill="#000000" /> : <Play size={26} color="#000000" fill="#000000" style={{ marginLeft: 3 }} />}
+                </button>
+                <button onClick={() => stepTrack(1)} className="press"><SkipForward size={26} fill="#FFFFFF" /></button>
+              </div>
+
+              <div className="w-full max-w-xs flex items-center gap-3">
+                <span className="text-xs w-9 text-right" style={{ color: "#98989D" }}>{fmtTime(currentTime)}</span>
+                <div className="flex-1 h-1 rounded-full" style={{ background: "rgba(255,255,255,0.15)" }}>
+                  <div className="h-1 rounded-full" style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%`, background: accent }} />
+                </div>
+                <span className="text-xs w-9" style={{ color: "#98989D" }}>{fmtTime(duration)}</span>
+              </div>
+              <div className="text-[10px] text-center" style={{ color: "#5A5A5C" }}>Tap the record to play/pause · swipe to skip</div>
+            </div>
+          </div>
+        );
+      })()}
 
       {contextTrackId && (
         <BottomSheetBackdrop onClose={closeContext}>
