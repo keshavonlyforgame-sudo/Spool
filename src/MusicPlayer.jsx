@@ -3,9 +3,11 @@ import {
   Play, Pause, SkipBack, SkipForward, Shuffle, Repeat, Repeat1,
   Upload, Plus, Trash2, Music, ListMusic, Volume2, VolumeX, X,
   Disc3, Search, SlidersHorizontal, Moon, GripVertical, ChevronDown,
-  ChevronRight, Home, Library as LibraryIcon, MoreHorizontal,
-  ListPlus, CornerDownRight, Info, Mic2, ArrowLeft, LayoutGrid,
-  List as ListIcon, ArrowUpDown, Clock, TrendingUp
+  Home, Library as LibraryIcon, MoreHorizontal, ListPlus, CornerDownRight,
+  Info, Mic2, ArrowLeft, LayoutGrid, List as ListIcon, ArrowUpDown,
+  Clock, TrendingUp, Heart, CheckCircle2, Circle, PictureInPicture2,
+  Share2, FolderPlus, Tag, HardDrive, Download, Upload as UploadIcon,
+  Settings, Sparkles
 } from "lucide-react";
 
 // =====================================================================
@@ -56,9 +58,22 @@ async function computePeaks(file, samples = 160) {
       peaks[i] = max;
     }
     const peakMax = Math.max(...peaks, 0.01);
-    return { peaks: peaks.map((p) => p / peakMax), duration: audioBuffer.duration };
+    const normPeaks = peaks.map((p) => p / peakMax);
+
+    // WOW — auto silence-trim: detect near-silent lead-in/lead-out so
+    // playback can skip dead air at the start of a track automatically.
+    const SILENCE_THRESH = 0.04;
+    let leadIdx = 0;
+    while (leadIdx < normPeaks.length && normPeaks[leadIdx] < SILENCE_THRESH) leadIdx++;
+    let tailIdx = normPeaks.length - 1;
+    while (tailIdx > 0 && normPeaks[tailIdx] < SILENCE_THRESH) tailIdx--;
+    const secondsPerSample = audioBuffer.duration / samples;
+    const trimStart = leadIdx > 1 ? +(leadIdx * secondsPerSample).toFixed(2) : 0;
+    const trimEnd = tailIdx < normPeaks.length - 2 ? +((normPeaks.length - 1 - tailIdx) * secondsPerSample).toFixed(2) : 0;
+
+    return { peaks: normPeaks, duration: audioBuffer.duration, trimStart, trimEnd };
   } catch {
-    return { peaks: null, duration: 0 };
+    return { peaks: null, duration: 0, trimStart: 0, trimEnd: 0 };
   }
 }
 
@@ -67,7 +82,7 @@ async function extractIdMp3Art(file) {
   try {
     const head = await file.slice(0, 10).arrayBuffer();
     const h = new Uint8Array(head);
-    if (!(h[0] === 0x49 && h[1] === 0x44 && h[2] === 0x33)) return null; // "ID3"
+    if (!(h[0] === 0x49 && h[1] === 0x44 && h[2] === 0x33)) return null;
     const size = ((h[6] & 0x7f) << 21) | ((h[7] & 0x7f) << 14) | ((h[8] & 0x7f) << 7) | (h[9] & 0x7f);
     const tagBuf = await file.slice(10, 10 + size).arrayBuffer();
     const bytes = new Uint8Array(tagBuf);
@@ -83,7 +98,7 @@ async function extractIdMp3Art(file) {
         while (bytes[mimeEnd] !== 0 && mimeEnd < offset + 10 + frameSize) mimeEnd++;
         const mime = new TextDecoder("ascii").decode(bytes.slice(p, mimeEnd));
         p = mimeEnd + 1;
-        p += 1; // picture type byte
+        p += 1;
         if (enc === 1 || enc === 2) {
           while (!(bytes[p] === 0 && bytes[p + 1] === 0) && p < offset + 10 + frameSize) p += 2;
           p += 2;
@@ -99,12 +114,11 @@ async function extractIdMp3Art(file) {
     return null;
   } catch { return null; }
 }
-
 async function extractFlacArt(file) {
   try {
     const sigBuf = await file.slice(0, 4).arrayBuffer();
     const sig = new Uint8Array(sigBuf);
-    if (!(sig[0] === 0x66 && sig[1] === 0x4c && sig[2] === 0x61 && sig[3] === 0x43)) return null; // "fLaC"
+    if (!(sig[0] === 0x66 && sig[1] === 0x4c && sig[2] === 0x61 && sig[3] === 0x43)) return null;
     let pos = 4;
     for (let guard = 0; guard < 64; guard++) {
       const hdrBuf = await file.slice(pos, pos + 4).arrayBuffer();
@@ -133,7 +147,6 @@ async function extractFlacArt(file) {
     return null;
   } catch { return null; }
 }
-
 async function extractEmbeddedArt(file) {
   const ext = file.name.split(".").pop().toLowerCase();
   if (ext === "mp3") return extractIdMp3Art(file);
@@ -141,7 +154,30 @@ async function extractEmbeddedArt(file) {
   return null;
 }
 
-// ---- IndexedDB persistence (survives app close / background kill) ----
+// WOW — dominant color sampled from the real album art, used to theme Now Playing
+function extractDominantColor(url) {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = 16; canvas.height = 16;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, 16, 16);
+          const data = ctx.getImageData(0, 0, 16, 16).data;
+          let r = 0, g = 0, b = 0, n = 0;
+          for (let i = 0; i < data.length; i += 4) { r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
+          resolve({ r: Math.round(r / n), g: Math.round(g / n), b: Math.round(b / n) });
+        } catch { resolve(null); }
+      };
+      img.onerror = () => resolve(null);
+      img.src = url;
+    } catch { resolve(null); }
+  });
+}
+
+// ---- IndexedDB persistence ----
 const DB_NAME = "spool-db", DB_VERSION = 1;
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -199,25 +235,32 @@ async function idbGetMeta(key) {
 }
 
 const SPRING = "cubic-bezier(0.32, 0.72, 0, 1)";
-const ACCENTS = [
-  { name: "Ruby", hex: "#FA2D48" },
-  { name: "Amber", hex: "#FF9F0A" },
-  { name: "Citrine", hex: "#FFD60A" },
-  { name: "Emerald", hex: "#30D158" },
-  { name: "Azure", hex: "#0A84FF" },
-  { name: "Violet", hex: "#BF5AF2" },
-  { name: "Rose", hex: "#FF375F" },
-];
+const CROSSFADE_SEC = 3;
+const THEMES = {
+  amoled: { bg: "#000000", surface: "#1C1C1E", surface2: "#2C2C2E", text: "#FFFFFF", subtext: "#98989D", accent: "#FA2D48" },
+  colorful: { bg: "#12071F", surface: "#1F1235", surface2: "#2C1A47", text: "#FFFFFF", subtext: "#B6A6D6", accent: "#B84DFF" },
+  light: { bg: "#F5F5F7", surface: "#FFFFFF", surface2: "#ECECEE", text: "#111111", subtext: "#6E6E73", accent: "#FA2D48" },
+};
+const MILESTONES = [10, 25, 50, 100, 250, 500, 1000];
+const MOOD_TAGS = ["Chill", "Workout", "Study", "Party", "Focus"];
+
+const EQ_PRESETS = {
+  Flat: { bass: 0, mid: 0, treble: 0 },
+  "Bass Boost": { bass: 7, mid: 1, treble: 0 },
+  Vocal: { bass: -2, mid: 5, treble: 2 },
+  Rock: { bass: 4, mid: -2, treble: 4 },
+};
 
 // =====================================================================
 export default function MusicPlayer() {
   const [loaded, setLoaded] = useState(false);
-  const [library, setLibrary] = useState([]); // {id,name,ext,file,peaks,duration,addedAt,artUrl}
+  const [library, setLibrary] = useState([]);
   const [playlists, setPlaylists] = useState([]);
   const [lyricsMap, setLyricsMap] = useState({});
   const [playCounts, setPlayCounts] = useState({});
   const [recentlyPlayed, setRecentlyPlayed] = useState([]);
-  const [positions, setPositions] = useState({}); // {trackId: seconds} — resume support
+  const [positions, setPositions] = useState({});
+  const [likedIds, setLikedIds] = useState([]);
 
   const [activeTab, setActiveTab] = useState("home");
   const [openPlaylistId, setOpenPlaylistId] = useState(null);
@@ -225,6 +268,9 @@ export default function MusicPlayer() {
   const [librarySort, setLibrarySort] = useState("recent");
   const [libraryView, setLibraryView] = useState("list");
   const [showSortMenu, setShowSortMenu] = useState(false);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [bulkAddSheetOpen, setBulkAddSheetOpen] = useState(false);
 
   const [queue, setQueue] = useState([]);
   const [queueIndex, setQueueIndex] = useState(-1);
@@ -237,6 +283,7 @@ export default function MusicPlayer() {
   const [muted, setMuted] = useState(false);
   const [shuffle, setShuffle] = useState(false);
   const [repeatMode, setRepeatMode] = useState("off");
+  const [themeColor, setThemeColor] = useState(null);
 
   const [nowPlayingOpen, setNowPlayingOpen] = useState(false);
   const [npView, setNpView] = useState("player");
@@ -245,6 +292,7 @@ export default function MusicPlayer() {
   const [artSwipeX, setArtSwipeX] = useState(0);
   const [showEq, setShowEq] = useState(false);
   const [eqBands, setEqBands] = useState({ bass: 0, mid: 0, treble: 0 });
+  const [eqPreset, setEqPreset] = useState("Flat");
   const [showSleep, setShowSleep] = useState(false);
   const [sleepEndsAt, setSleepEndsAt] = useState(null);
   const [sleepRemaining, setSleepRemaining] = useState(null);
@@ -259,14 +307,33 @@ export default function MusicPlayer() {
   const [dragOver, setDragOver] = useState(false);
   const [rowDragIdx, setRowDragIdx] = useState(null);
 
-  // ---- Vinyl Mode: full-screen spinning-record experience ----
+  // ---- new feature state ----
+  const [theme, setTheme] = useState("amoled"); // amoled | colorful | light
+  const [showSettings, setShowSettings] = useState(false);
+  const [normalizeVolume, setNormalizeVolume] = useState(false);
+  const [smartContinueEnabled, setSmartContinueEnabled] = useState(true);
   const [vinylMode, setVinylMode] = useState(false);
-  const [accentIdx, setAccentIdx] = useState(0);
-  const [crackleOn, setCrackleOn] = useState(false);
-  const [vinylSwipeX, setVinylSwipeX] = useState(0);
-  const [wakeLockActive, setWakeLockActive] = useState(false);
+  const [tagsMap, setTagsMap] = useState({});
+  const [activeTagFilter, setActiveTagFilter] = useState(null);
+  const [tagSheetTrackId, setTagSheetTrackId] = useState(null);
+  const [showStats, setShowStats] = useState(false);
+  const [celebratedMilestones, setCelebratedMilestones] = useState([]);
+  const [confettiMilestone, setConfettiMilestone] = useState(null);
+  const [storageEstimate, setStorageEstimate] = useState(null);
+  const backupInputRef = useRef(null);
+  const folderInputRef = useRef(null);
+  const pipCanvasRef = useRef(null);
+  const pipVideoRef = useRef(null);
 
-  const audioRef = useRef(null);
+  const audioARef = useRef(null);
+  const audioBRef = useRef(null);
+  const gainARef = useRef(null);
+  const gainBRef = useRef(null);
+  const activeDeckRef = useRef("A");
+  const crossfadingRef = useRef(false);
+  const urlARef = useRef(null);
+  const urlBRef = useRef(null);
+
   const fileInputRef = useRef(null);
   const vuCanvasRef = useRef(null);
   const waveCanvasRef = useRef(null);
@@ -275,28 +342,28 @@ export default function MusicPlayer() {
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
   const masterGainRef = useRef(null);
+  const normGainRef = useRef(null);
+  const normLevelRef = useRef(0.5);
+  const normalizeVolumeRef = useRef(false);
   const eqRefs = useRef({});
   const rafRef = useRef(null);
   const sleepTimeoutRef = useRef(null);
   const sleepFadeTimeoutRef = useRef(null);
-  const currentUrlRef = useRef(null);
   const touchStartY = useRef(0);
   const artTouchStartX = useRef(0);
   const toastTimer = useRef(null);
   const resumeSeekRef = useRef(null);
   const lastSaveRef = useRef(0);
-  const wakeLockRef = useRef(null);
-  const noiseGainRef = useRef(null);
-  const noiseSourceRef = useRef(null);
-  const vinylTouchStartX = useRef(0);
 
   const currentTrack = library.find((t) => t.id === queue[queueIndex]) || null;
   const activePlaylist = playlists.find((p) => p.id === openPlaylistId) || null;
+  const deckAudio = (d) => (d === "A" ? audioARef.current : audioBRef.current);
+  const deckGain = (d) => (d === "A" ? gainARef.current : gainBRef.current);
+  const deckUrlRef = (d) => (d === "A" ? urlARef : urlBRef);
+  const otherDeck = (d) => (d === "A" ? "B" : "A");
 
   const showToast = (msg) => { setToast(msg); clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(null), 1800); };
 
-  // ------------------------------------------------------------------
-  // load persisted state on first mount
   // ------------------------------------------------------------------
   useEffect(() => {
     (async () => {
@@ -305,66 +372,95 @@ export default function MusicPlayer() {
         setLibrary(tracks.map((r) => ({
           id: r.id, name: r.name, ext: r.ext, duration: r.duration, peaks: r.peaks,
           addedAt: r.addedAt, file: r.blob, artUrl: r.artBlob ? URL.createObjectURL(r.artBlob) : null,
+          trimStart: r.trimStart || 0, trimEnd: r.trimEnd || 0,
         })));
         const pl = await idbGetMeta("playlists"); if (pl) setPlaylists(pl);
         const ly = await idbGetMeta("lyrics"); if (ly) setLyricsMap(ly);
         const pc = await idbGetMeta("playCounts"); if (pc) setPlayCounts(pc);
-        const rp = await idbGetMeta("recentlyPlayed"); if (rp) setRecentlyPlayed(rp);
+        const rp = await idbGetMeta("recentlyPlayed");
+        if (rp) setRecentlyPlayed(rp.length && typeof rp[0] === "string" ? rp.map((id) => ({ id, ts: Date.now() })) : rp);
+        const tg = await idbGetMeta("tags"); if (tg) setTagsMap(tg);
+        const cm = await idbGetMeta("celebratedMilestones"); if (cm) setCelebratedMilestones(cm);
+        const th = await idbGetMeta("theme"); if (th) setTheme(th);
         const ps = await idbGetMeta("positions"); if (ps) setPositions(ps);
-      } catch { /* fresh start if IndexedDB unavailable */ }
+        const lk = await idbGetMeta("liked"); if (lk) setLikedIds(lk);
+      } catch { /* fresh start */ }
       setLoaded(true);
     })();
   }, []);
-
   useEffect(() => { if (loaded) idbSetMeta("playlists", playlists); }, [playlists, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("lyrics", lyricsMap); }, [lyricsMap, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("playCounts", playCounts); }, [playCounts, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("recentlyPlayed", recentlyPlayed); }, [recentlyPlayed, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("tags", tagsMap); }, [tagsMap, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("celebratedMilestones", celebratedMilestones); }, [celebratedMilestones, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("theme", theme); }, [theme, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("positions", positions); }, [positions, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("liked", likedIds); }, [likedIds, loaded]);
 
-  // launched from the "Vinyl Mode" home-screen shortcut — jump straight in once a track is ready
+  // WOW #2 — dynamic color theme sampled from the real album art
   useEffect(() => {
-    if (!loaded) return;
-    const wantsVinyl = new URLSearchParams(window.location.search).get("vinyl") === "1";
-    if (!wantsVinyl) return;
-    if (currentTrack) { setVinylMode(true); }
-    else if (library.length) { playFrom(library, 0, "Library"); setVinylMode(true); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded]);
+    let cancelled = false;
+    if (currentTrack?.artUrl) extractDominantColor(currentTrack.artUrl).then((c) => { if (!cancelled) setThemeColor(c); });
+    else setThemeColor(null);
+    return () => { cancelled = true; };
+  }, [currentTrack?.id, currentTrack?.artUrl]);
+  const accent = themeColor ? `rgb(${themeColor.r},${themeColor.g},${themeColor.b})` : currentTrack ? `hsl(${artHue(currentTrack.name)} 70% 55%)` : "#FA2D48";
 
-  // ------------------------------------------------------------------
-  // smart / computed lists
   // ------------------------------------------------------------------
   const recentlyAdded = [...library].sort((a, b) => b.addedAt - a.addedAt).slice(0, 25);
-  const recentlyPlayedTracks = recentlyPlayed.map((id) => library.find((t) => t.id === id)).filter(Boolean).slice(0, 25);
+  const recentlyPlayedTracks = recentlyPlayed.map((r) => library.find((t) => t.id === r.id)).filter(Boolean).slice(0, 25);
+  const palette = THEMES[theme] || THEMES.amoled;
+  const glassBar = theme === "light" ? "rgba(255,255,255,0.85)" : "rgba(20,20,22,0.85)";
+  const glassPanel = theme === "light" ? "rgba(255,255,255,0.9)" : "rgba(44,44,46,0.85)";
+  const sheetBg = theme === "light" ? "#FFFFFF" : palette.surface;
+  const filteredTagLibrary = activeTagFilter ? library.filter((t) => (tagsMap[t.id] || []).includes(activeTagFilter)) : null;
+
+  const weekMs = 7 * 24 * 60 * 60 * 1000;
+  const weekAgo = Date.now() - weekMs;
+  const weeklyPlays = recentlyPlayed.filter((r) => r.ts >= weekAgo);
+  const weeklyCounts = {};
+  weeklyPlays.forEach((r) => { weeklyCounts[r.id] = (weeklyCounts[r.id] || 0) + 1; });
+  const weeklyTop = Object.entries(weeklyCounts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([id, count]) => ({ track: library.find((t) => t.id === id), count })).filter((x) => x.track);
+  const weeklyMinutes = Math.round(weeklyPlays.reduce((sum, r) => sum + (library.find((t) => t.id === r.id)?.duration || 180), 0) / 60);
+  const totalLifetimePlays = Object.values(playCounts).reduce((a, b) => a + b, 0);
   const mostPlayed = [...library].filter((t) => playCounts[t.id] > 0).sort((a, b) => (playCounts[b.id] || 0) - (playCounts[a.id] || 0)).slice(0, 25);
+  const likedTracks = likedIds.map((id) => library.find((t) => t.id === id)).filter(Boolean);
+  const toggleLike = (id) => setLikedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [id, ...prev]));
 
   const sortedLibrary = (() => {
-    const arr = [...library];
+    const arr = [...(filteredTagLibrary || library)];
     if (librarySort === "name") arr.sort((a, b) => a.name.localeCompare(b.name));
     else if (librarySort === "duration") arr.sort((a, b) => (b.duration || 0) - (a.duration || 0));
     else arr.sort((a, b) => b.addedAt - a.addedAt);
     return arr;
   })();
-
   const playlistTracks = activePlaylist ? activePlaylist.trackIds.map((tid) => library.find((t) => t.id === tid)).filter(Boolean) : [];
 
   // ------------------------------------------------------------------
-  // Web Audio graph: source -> bass -> mid -> treble -> analyser -> masterGain -> out
+  // Web Audio graph — TWO decks mixed together for real crossfade
+  // deckA/B -> gainA/B -> mix -> bass -> mid -> treble -> analyser -> masterGain -> out
   // ------------------------------------------------------------------
   const ensureAudioGraph = useCallback(() => {
-    if (!audioRef.current || audioCtxRef.current) return;
+    if (audioCtxRef.current || !audioARef.current || !audioBRef.current) return;
     const AC = window.AudioContext || window.webkitAudioContext;
     const ctx = new AC();
-    const source = ctx.createMediaElementSource(audioRef.current);
+    const srcA = ctx.createMediaElementSource(audioARef.current);
+    const srcB = ctx.createMediaElementSource(audioBRef.current);
+    const gainA = ctx.createGain(); gainA.gain.value = 1;
+    const gainB = ctx.createGain(); gainB.gain.value = 0;
+    const mix = ctx.createGain();
+    srcA.connect(gainA); gainA.connect(mix);
+    srcB.connect(gainB); gainB.connect(mix);
     const bass = ctx.createBiquadFilter(); bass.type = "lowshelf"; bass.frequency.value = 200;
     const mid = ctx.createBiquadFilter(); mid.type = "peaking"; mid.frequency.value = 1000; mid.Q.value = 1;
     const treble = ctx.createBiquadFilter(); treble.type = "highshelf"; treble.frequency.value = 3000;
     const analyser = ctx.createAnalyser(); analyser.fftSize = 64;
+    const normGain = ctx.createGain(); normGain.gain.value = 1;
     const masterGain = ctx.createGain(); masterGain.gain.value = 1;
-    source.connect(bass); bass.connect(mid); mid.connect(treble);
-    treble.connect(analyser); analyser.connect(masterGain); masterGain.connect(ctx.destination);
-    audioCtxRef.current = ctx; analyserRef.current = analyser; masterGainRef.current = masterGain;
+    mix.connect(bass); bass.connect(mid); mid.connect(treble); treble.connect(analyser); analyser.connect(normGain); normGain.connect(masterGain); masterGain.connect(ctx.destination);
+    audioCtxRef.current = ctx; gainARef.current = gainA; gainBRef.current = gainB;
+    analyserRef.current = analyser; masterGainRef.current = masterGain; normGainRef.current = normGain;
     eqRefs.current = { bass, mid, treble };
   }, []);
 
@@ -375,89 +471,25 @@ export default function MusicPlayer() {
     if (treble) treble.gain.value = eqBands.treble;
   }, [eqBands]);
 
-  // ------------------------------------------------------------------
-  // WOW — synthesized vinyl crackle/hiss ambiance (generated noise, loops forever,
-  // mixed in on its own gain node so it's independent of the EQ/master chain)
-  // ------------------------------------------------------------------
-  const ensureNoiseGraph = useCallback(() => {
-    if (!audioCtxRef.current || noiseSourceRef.current) return;
-    const ctx = audioCtxRef.current;
-    const bufSize = ctx.sampleRate * 2;
-    const buffer = ctx.createBuffer(1, bufSize, ctx.sampleRate);
-    const data = buffer.getChannelData(0);
-    let lastOut = 0;
-    for (let i = 0; i < bufSize; i++) {
-      const white = Math.random() * 2 - 1;
-      // gentle low-pass + occasional pop for a warmer "vinyl" texture vs raw static
-      lastOut = (lastOut + 0.04 * white) / 1.04;
-      data[i] = lastOut * 4 + (Math.random() < 0.0006 ? (Math.random() * 2 - 1) * 0.6 : 0);
-    }
-    const src = ctx.createBufferSource();
-    src.buffer = buffer; src.loop = true;
-    const filter = ctx.createBiquadFilter(); filter.type = "highpass"; filter.frequency.value = 500;
-    const gain = ctx.createGain(); gain.gain.value = 0;
-    src.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
-    src.start();
-    noiseSourceRef.current = src; noiseGainRef.current = gain;
-  }, []);
-
-  useEffect(() => {
-    if (crackleOn) { ensureAudioGraph(); ensureNoiseGraph(); }
-    const g = noiseGainRef.current, ctx = audioCtxRef.current;
-    if (!g || !ctx) return;
-    const now = ctx.currentTime;
-    g.gain.cancelScheduledValues(now);
-    g.gain.setValueAtTime(g.gain.value, now);
-    g.gain.linearRampToValueAtTime(crackleOn && isPlaying ? 0.05 : 0, now + 0.4);
-  }, [crackleOn, isPlaying, ensureAudioGraph, ensureNoiseGraph]);
-
-  // ------------------------------------------------------------------
-  // WOW — Screen Wake Lock while Vinyl Mode is open, so the record keeps
-  // spinning on screen instead of the phone locking mid-play.
-  // ------------------------------------------------------------------
-  useEffect(() => {
-    let cancelled = false;
-    const acquire = async () => {
-      if (!("wakeLock" in navigator) || !vinylMode) return;
-      try {
-        const lock = await navigator.wakeLock.request("screen");
-        if (cancelled) { lock.release(); return; }
-        wakeLockRef.current = lock;
-        setWakeLockActive(true);
-        lock.addEventListener("release", () => setWakeLockActive(false));
-      } catch { setWakeLockActive(false); }
-    };
-    if (vinylMode) acquire();
-    else { wakeLockRef.current?.release?.(); wakeLockRef.current = null; setWakeLockActive(false); }
-    const onVisible = () => { if (document.visibilityState === "visible" && vinylMode) acquire(); };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => { cancelled = true; document.removeEventListener("visibilitychange", onVisible); };
-  }, [vinylMode]);
+  useEffect(() => { normalizeVolumeRef.current = normalizeVolume; }, [normalizeVolume]);
 
   const fadeTo = (target, ms) => {
     const g = masterGainRef.current, ctx = audioCtxRef.current;
     if (!g || !ctx) return Promise.resolve();
     const now = ctx.currentTime;
-    g.gain.cancelScheduledValues(now);
-    g.gain.setValueAtTime(g.gain.value, now);
-    g.gain.linearRampToValueAtTime(target, now + ms / 1000);
+    g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(g.gain.value, now); g.gain.linearRampToValueAtTime(target, now + ms / 1000);
     return new Promise((res) => setTimeout(res, ms));
   };
 
   // ------------------------------------------------------------------
-  // VU + waveform + reactive background pulse — one shared draw loop
-  // ------------------------------------------------------------------
   useEffect(() => {
     const draw = () => {
-      let level = 0;
-      const hasData = analyserRef.current && isPlaying;
-      let data = null;
-      if (hasData) {
+      let level = 0, data = null;
+      if (analyserRef.current && isPlaying) {
         data = new Uint8Array(analyserRef.current.frequencyBinCount);
         analyserRef.current.getByteFrequencyData(data);
         level = data.reduce((a, b) => a + b, 0) / data.length / 255;
       }
-
       const vu = vuCanvasRef.current;
       if (vu) {
         const c = vu.getContext("2d");
@@ -469,11 +501,10 @@ export default function MusicPlayer() {
           let l = 0;
           if (data) l = data[Math.floor((i / bars) * data.length)] / 255;
           const barH = Math.max(2, l * h);
-          c.fillStyle = l > 0.82 ? "#FF375F" : "#FA2D48";
+          c.fillStyle = l > 0.82 ? "#FF375F" : accent;
           c.fillRect(i * (barW + gap), h - barH, barW, barH);
         }
       }
-
       const wave = waveCanvasRef.current;
       if (wave) {
         const c = wave.getContext("2d");
@@ -487,33 +518,40 @@ export default function MusicPlayer() {
           peaks.forEach((p, i) => {
             const barH = Math.max(2, p * (h - 4));
             const x = i * barW, y = (h - barH) / 2;
-            c.fillStyle = i / peaks.length < progressRatio ? "#FFFFFF" : "rgba(255,255,255,0.25)";
+            c.fillStyle = i / peaks.length < progressRatio ? accent : "rgba(255,255,255,0.25)";
             c.fillRect(x, y, Math.max(1, barW - 1), barH);
           });
         } else {
           c.fillStyle = "rgba(255,255,255,0.2)"; c.fillRect(0, h / 2 - 1, w, 2);
-          c.fillStyle = "#FFFFFF"; c.fillRect(0, h / 2 - 1, w * progressRatio, 2);
+          c.fillStyle = accent; c.fillRect(0, h / 2 - 1, w * progressRatio, 2);
         }
       }
-
-      // WOW #3 — ambient background breathes with the music's live energy
       if (bgGlowRef.current) {
         bgGlowRef.current.style.transform = `scale(${1 + level * 0.18})`;
         bgGlowRef.current.style.opacity = String(0.5 + level * 0.35);
       }
-
+      // WOW — loudness normalization: gently nudge gain so quiet and loud
+      // tracks land closer to a similar perceived volume.
+      if (normGainRef.current && audioCtxRef.current) {
+        if (normalizeVolumeRef.current && isPlaying && level > 0.02) {
+          normLevelRef.current = normLevelRef.current * 0.97 + level * 0.03;
+          const target = Math.max(0.4, Math.min(2.2, 0.5 / normLevelRef.current));
+          const g = normGainRef.current.gain;
+          const now = audioCtxRef.current.currentTime;
+          g.setTargetAtTime(target, now, 0.6);
+        } else {
+          normGainRef.current.gain.setTargetAtTime(1, audioCtxRef.current.currentTime, 0.6);
+        }
+      }
       rafRef.current = requestAnimationFrame(draw);
     };
     rafRef.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [isPlaying, currentTrack, currentTime, duration]);
+  }, [isPlaying, currentTrack, currentTime, duration, accent]);
 
   useEffect(() => {
     const resize = () => {
-      if (waveCanvasRef.current && waveWrapRef.current) {
-        waveCanvasRef.current.width = waveWrapRef.current.clientWidth;
-        waveCanvasRef.current.height = 44;
-      }
+      if (waveCanvasRef.current && waveWrapRef.current) { waveCanvasRef.current.width = waveWrapRef.current.clientWidth; waveCanvasRef.current.height = 44; }
     };
     resize();
     window.addEventListener("resize", resize);
@@ -521,7 +559,7 @@ export default function MusicPlayer() {
   }, [nowPlayingOpen]);
 
   // ------------------------------------------------------------------
-  // File import — extracts waveform peaks + embedded album art, persists to IndexedDB
+  // File import
   // ------------------------------------------------------------------
   const importFiles = async (fileList) => {
     const files = Array.from(fileList).filter((f) => f.type.startsWith("audio/") || /\.(mp3|flac|wav|m4a|ogg|opus)$/i.test(f.name));
@@ -536,59 +574,72 @@ export default function MusicPlayer() {
     showToast(`Added ${drafts.length} track${drafts.length !== 1 ? "s" : ""}${dupeCount ? ` (${dupeCount} possible duplicate${dupeCount !== 1 ? "s" : ""})` : ""}`);
     for (const d of drafts) {
       idbPutTrack({ id: d.id, name: d.name, ext: d.ext, duration: 0, peaks: null, addedAt: d.addedAt, blob: d.file, artBlob: null });
-      const [{ peaks, duration }, artBlob] = await Promise.all([computePeaks(d.file), extractEmbeddedArt(d.file)]);
+      const [{ peaks, duration, trimStart, trimEnd }, artBlob] = await Promise.all([computePeaks(d.file), extractEmbeddedArt(d.file)]);
       const artUrl = artBlob ? URL.createObjectURL(artBlob) : null;
-      setLibrary((prev) => prev.map((t) => (t.id === d.id ? { ...t, peaks, duration: duration || t.duration, artUrl } : t)));
-      idbPutTrack({ id: d.id, name: d.name, ext: d.ext, duration: duration || 0, peaks, addedAt: d.addedAt, blob: d.file, artBlob });
+      setLibrary((prev) => prev.map((t) => (t.id === d.id ? { ...t, peaks, duration: duration || t.duration, artUrl, trimStart, trimEnd } : t)));
+      idbPutTrack({ id: d.id, name: d.name, ext: d.ext, duration: duration || 0, peaks, addedAt: d.addedAt, blob: d.file, artBlob, trimStart, trimEnd });
     }
   };
-
   const onFileInputChange = (e) => { if (e.target.files?.length) importFiles(e.target.files); e.target.value = ""; };
   const onDrop = (e) => { e.preventDefault(); setDragOver(false); if (e.dataTransfer.files?.length) importFiles(e.dataTransfer.files); };
 
   // ------------------------------------------------------------------
-  // Playback engine
+  // WOW #1 — dual-deck playback engine with true overlapping crossfade
   // ------------------------------------------------------------------
-  const loadTrackById = async (id, autoplay = true, { fade = false } = {}) => {
+  const loadTrackById = async (id, autoplay = true) => {
     const track = library.find((t) => t.id === id);
     if (!track) return;
     ensureAudioGraph();
+    if (audioCtxRef.current?.state === "suspended") audioCtxRef.current.resume();
 
-    // save resume position of the track we're leaving
-    if (currentTrack && audioRef.current) {
-      setPositions((prev) => ({ ...prev, [currentTrack.id]: audioRef.current.currentTime }));
-    }
-    if (fade && isPlaying) await fadeTo(0, 280);
+    const prevDeck = activeDeckRef.current;
+    const prevAudio = deckAudio(prevDeck);
+    if (currentTrack && prevAudio) setPositions((prev) => ({ ...prev, [currentTrack.id]: prevAudio.currentTime }));
 
-    if (currentUrlRef.current) { URL.revokeObjectURL(currentUrlRef.current); currentUrlRef.current = null; }
+    const doCrossfade = isPlaying && !crossfadingRef.current;
+    const targetDeck = doCrossfade ? otherDeck(prevDeck) : prevDeck;
+    const targetAudio = deckAudio(targetDeck);
+    const targetGain = deckGain(targetDeck);
+    const tUrlRef = deckUrlRef(targetDeck);
+
+    if (tUrlRef.current) { URL.revokeObjectURL(tUrlRef.current); tUrlRef.current = null; }
     const url = URL.createObjectURL(track.file);
-    currentUrlRef.current = url;
+    tUrlRef.current = url;
+
     setCurrentTime(0);
-    resumeSeekRef.current = positions[id] > 3 ? positions[id] : null;
-    setRecentlyPlayed((prev) => [id, ...prev.filter((x) => x !== id)].slice(0, 50));
+    resumeSeekRef.current = positions[id] > 3 ? positions[id] : (track.trimStart > 0.3 ? track.trimStart : null);
+    setRecentlyPlayed((prev) => [{ id, ts: Date.now() }, ...prev.filter((r) => r.id !== id)].slice(0, 200));
+    checkMilestone();
     setPlayCounts((prev) => ({ ...prev, [id]: (prev[id] || 0) + 1 }));
 
-    requestAnimationFrame(() => {
-      if (audioCtxRef.current?.state === "suspended") audioCtxRef.current.resume();
-      if (audioRef.current) {
-        audioRef.current.src = url;
-        if (autoplay) { audioRef.current.play().catch(() => {}); setIsPlaying(true); }
+    targetAudio.src = url;
+    targetAudio.currentTime = 0;
+
+    if (doCrossfade) {
+      crossfadingRef.current = true;
+      const ctx = audioCtxRef.current;
+      const now = ctx.currentTime;
+      targetGain.gain.cancelScheduledValues(now); targetGain.gain.setValueAtTime(0, now); targetGain.gain.linearRampToValueAtTime(1, now + CROSSFADE_SEC);
+      const prevGain = deckGain(prevDeck);
+      prevGain.gain.cancelScheduledValues(now); prevGain.gain.setValueAtTime(prevGain.gain.value, now); prevGain.gain.linearRampToValueAtTime(0, now + CROSSFADE_SEC);
+      targetAudio.play().catch(() => {});
+      activeDeckRef.current = targetDeck;
+      setIsPlaying(true);
+      setTimeout(() => { try { prevAudio.pause(); } catch {} crossfadingRef.current = false; }, CROSSFADE_SEC * 1000 + 80);
+    } else {
+      crossfadingRef.current = false;
+      const other = otherDeck(targetDeck);
+      try { deckAudio(other).pause(); } catch {}
+      if (audioCtxRef.current) {
+        deckGain(other).gain.setValueAtTime(0, audioCtxRef.current.currentTime);
+        targetGain.gain.setValueAtTime(1, audioCtxRef.current.currentTime);
       }
-      if (masterGainRef.current && audioCtxRef.current) masterGainRef.current.gain.setValueAtTime(fade ? 0 : 1, audioCtxRef.current.currentTime);
-      if (fade) fadeTo(1, 320);
-    });
+      activeDeckRef.current = targetDeck;
+      if (autoplay) { targetAudio.play().catch(() => {}); setIsPlaying(true); }
+    }
   };
 
-  const onAudioError = () => {
-    if (!currentTrack) return;
-    if (currentUrlRef.current) URL.revokeObjectURL(currentUrlRef.current);
-    const url = URL.createObjectURL(currentTrack.file);
-    currentUrlRef.current = url;
-    audioRef.current.src = url;
-    if (isPlaying) audioRef.current.play().catch(() => {});
-  };
-
-  useEffect(() => () => { if (currentUrlRef.current) URL.revokeObjectURL(currentUrlRef.current); }, []);
+  useEffect(() => () => { if (urlARef.current) URL.revokeObjectURL(urlARef.current); if (urlBRef.current) URL.revokeObjectURL(urlBRef.current); }, []);
 
   const playFrom = (list, index, sourceLabel) => {
     const ids = list.map((t) => t.id);
@@ -597,11 +648,11 @@ export default function MusicPlayer() {
   };
 
   const togglePlay = () => {
-    if (!audioRef.current || !currentTrack) return;
+    const a = deckAudio(activeDeckRef.current);
+    if (!a || !currentTrack) return;
     ensureAudioGraph();
     if (audioCtxRef.current?.state === "suspended") audioCtxRef.current.resume();
-    if (isPlaying) { audioRef.current.pause(); setIsPlaying(false); }
-    else { audioRef.current.play().catch(() => {}); setIsPlaying(true); }
+    if (isPlaying) { a.pause(); setIsPlaying(false); } else { a.play().catch(() => {}); setIsPlaying(true); }
   };
 
   const stepTrack = (dir) => {
@@ -610,28 +661,29 @@ export default function MusicPlayer() {
     if (shuffle) {
       let next = Math.floor(Math.random() * queue.length);
       if (queue.length > 1) while (next === idx) next = Math.floor(Math.random() * queue.length);
-      setQueueIndex(next); loadTrackById(queue[next], true, { fade: true });
+      setQueueIndex(next); loadTrackById(queue[next], true);
       return;
     }
     let next = idx + dir;
     if (next < 0) next = queue.length - 1;
     if (next >= queue.length) next = 0;
-    setQueueIndex(next); loadTrackById(queue[next], true, { fade: true });
+    setQueueIndex(next); loadTrackById(queue[next], true);
   };
 
-  const onEnded = () => {
-    if (repeatMode === "one") { audioRef.current.currentTime = 0; audioRef.current.play(); return; }
+  const handleAutoAdvance = () => {
+    if (repeatMode === "one") { const a = deckAudio(activeDeckRef.current); a.currentTime = 0; a.play(); return; }
     const isLast = queueIndex === queue.length - 1;
-    if (isLast && repeatMode === "off" && !shuffle) { setIsPlaying(false); return; }
+    if (isLast && repeatMode === "off" && !shuffle) { if (!appendSmartContinuation()) return; }
     stepTrack(1);
   };
 
   const cycleRepeat = () => setRepeatMode((m) => (m === "off" ? "all" : m === "all" ? "one" : "off"));
 
   const seekTo = (t) => {
-    if (!audioRef.current) return;
+    const a = deckAudio(activeDeckRef.current);
+    if (!a) return;
     const clamped = Math.max(0, Math.min(duration || 0, t));
-    audioRef.current.currentTime = clamped; setCurrentTime(clamped);
+    a.currentTime = clamped; setCurrentTime(clamped);
   };
   const onWaveClick = (e) => {
     if (!waveCanvasRef.current || !duration) return;
@@ -640,29 +692,43 @@ export default function MusicPlayer() {
   };
   const onVolumeChange = (e) => {
     const v = Number(e.target.value); setVolume(v); setMuted(false);
-    if (audioRef.current) audioRef.current.volume = v;
+    if (masterGainRef.current) {} // master gain reserved for fades; user volume applied per element below
+    [audioARef.current, audioBRef.current].forEach((el) => { if (el) el.volume = v; });
   };
-  useEffect(() => { if (audioRef.current) audioRef.current.volume = muted ? 0 : volume; }, [volume, muted]);
+  useEffect(() => {
+    const v = muted ? 0 : volume;
+    [audioARef.current, audioBRef.current].forEach((el) => { if (el) el.volume = v; });
+  }, [volume, muted]);
 
-  const onTimeUpdate = (e) => {
+  const onTimeUpdateFor = (deck) => (e) => {
+    if (activeDeckRef.current !== deck) return;
     const t = e.target.currentTime;
     setCurrentTime(t);
-    if (currentTrack && t - lastSaveRef.current > 5) {
-      lastSaveRef.current = t;
-      setPositions((prev) => ({ ...prev, [currentTrack.id]: t }));
-    }
+    if (currentTrack && t - lastSaveRef.current > 5) { lastSaveRef.current = t; setPositions((prev) => ({ ...prev, [currentTrack.id]: t })); }
+    const effectiveEnd = duration - (currentTrack?.trimEnd || 0);
+    if (isPlaying && !crossfadingRef.current && duration > CROSSFADE_SEC * 2 && effectiveEnd - t <= CROSSFADE_SEC) handleAutoAdvance();
   };
-  const onLoadedMetadata = (e) => {
+  const onLoadedMetadataFor = (deck) => (e) => {
+    if (activeDeckRef.current !== deck) return;
     setDuration(e.target.duration);
-    if (resumeSeekRef.current) {
-      e.target.currentTime = resumeSeekRef.current;
-      setCurrentTime(resumeSeekRef.current);
-      resumeSeekRef.current = null;
-    }
+    if (resumeSeekRef.current) { e.target.currentTime = resumeSeekRef.current; setCurrentTime(resumeSeekRef.current); resumeSeekRef.current = null; }
+  };
+  const onEndedFor = (deck) => () => {
+    if (activeDeckRef.current !== deck || crossfadingRef.current) return;
+    if (repeatMode === "one") { const a = deckAudio(deck); a.currentTime = 0; a.play(); return; }
+    const isLast = queueIndex === queue.length - 1;
+    if (isLast && repeatMode === "off" && !shuffle) { if (!appendSmartContinuation()) { setIsPlaying(false); return; } }
+    stepTrack(1);
+  };
+  const onAudioErrorFor = (deck) => () => {
+    if (activeDeckRef.current !== deck || !currentTrack) return;
+    const a = deckAudio(deck), r = deckUrlRef(deck);
+    if (r.current) URL.revokeObjectURL(r.current);
+    const url = URL.createObjectURL(currentTrack.file);
+    r.current = url; a.src = url;
+    if (isPlaying) a.play().catch(() => {});
   };
 
-  // ------------------------------------------------------------------
-  // queue actions
   // ------------------------------------------------------------------
   const playNext = (trackId) => {
     if (!queue.length) { playFrom(library.filter((t) => t.id === trackId), 0, "Now Playing"); showToast("Playing now"); return; }
@@ -674,10 +740,7 @@ export default function MusicPlayer() {
     setQueue((prev) => [...prev, trackId]);
     showToast("Added to queue");
   };
-  const removeFromQueue = (idx) => {
-    setQueue((prev) => prev.filter((_, i) => i !== idx));
-    if (idx < queueIndex) setQueueIndex((q) => q - 1);
-  };
+  const removeFromQueue = (idx) => { setQueue((prev) => prev.filter((_, i) => i !== idx)); if (idx < queueIndex) setQueueIndex((q) => q - 1); };
   const reorderQueue = (fromIdx, toIdx) => {
     if (fromIdx == null || fromIdx === toIdx) return;
     setQueue((prev) => {
@@ -693,9 +756,6 @@ export default function MusicPlayer() {
     });
   };
 
-  // ------------------------------------------------------------------
-  // keyboard shortcuts
-  // ------------------------------------------------------------------
   useEffect(() => {
     const onKeyDown = (e) => {
       const tag = document.activeElement?.tagName;
@@ -710,23 +770,14 @@ export default function MusicPlayer() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
-  // ------------------------------------------------------------------
-  // WOW #2 — MediaSession: clean lock-screen / notification (title + app name only)
-  // ------------------------------------------------------------------
   useEffect(() => {
     if (!("mediaSession" in navigator) || !currentTrack) return;
     navigator.mediaSession.metadata = new window.MediaMetadata({
-      title: currentTrack.name,
-      artist: "Spool",
-      album: "",
+      title: currentTrack.name, artist: "Spool", album: "",
       artwork: currentTrack.artUrl ? [{ src: currentTrack.artUrl, sizes: "512x512", type: "image/png" }] : [],
     });
   }, [currentTrack]);
-
-  useEffect(() => {
-    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
-  }, [isPlaying]);
-
+  useEffect(() => { if ("mediaSession" in navigator) navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused"; }, [isPlaying]);
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     navigator.mediaSession.setActionHandler("play", () => togglePlay());
@@ -734,29 +785,50 @@ export default function MusicPlayer() {
     navigator.mediaSession.setActionHandler("previoustrack", () => stepTrack(-1));
     navigator.mediaSession.setActionHandler("nexttrack", () => stepTrack(1));
     navigator.mediaSession.setActionHandler("seekto", (d) => { if (d.seekTime != null) seekTo(d.seekTime); });
-    navigator.mediaSession.setActionHandler("stop", () => { if (audioRef.current) audioRef.current.pause(); setIsPlaying(false); });
-    try {
-      navigator.mediaSession.setActionHandler("seekbackward", (d) => seekTo(currentTime - (d.seekOffset || 10)));
-      navigator.mediaSession.setActionHandler("seekforward", (d) => seekTo(currentTime + (d.seekOffset || 10)));
-    } catch { /* not supported everywhere */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queue, queueIndex, shuffle, repeatMode, isPlaying, duration]);
 
-  // keeps the OS lock-screen / notification scrubber in sync with playback
+  // WOW — keep playing in the background: some mobile browsers suspend the
+  // AudioContext when the app is backgrounded even though playback should
+  // continue. Auto-resume it the moment it drops to "suspended" while we
+  // still think we're playing. This covers normal backgrounding (switching
+  // apps, screen lock) — it can't survive the OS fully force-killing the
+  // browser/PWA process, no website can do that, it's a hard platform limit.
   useEffect(() => {
-    if (!("mediaSession" in navigator) || !("setPositionState" in navigator.mediaSession)) return;
-    if (!duration || !isFinite(duration)) return;
-    try {
-      navigator.mediaSession.setPositionState({ duration, playbackRate: 1, position: Math.min(currentTime, duration) });
-    } catch { /* ignore transient state errors */ }
-  }, [currentTime, duration]);
+    const resumeIfNeeded = () => {
+      const ctx = audioCtxRef.current;
+      if (ctx && ctx.state === "suspended" && isPlaying) ctx.resume().catch(() => {});
+    };
+    document.addEventListener("visibilitychange", resumeIfNeeded);
+    const iv = setInterval(resumeIfNeeded, 2000);
+    return () => { document.removeEventListener("visibilitychange", resumeIfNeeded); clearInterval(iv); };
+  }, [isPlaying]);
 
-  // ------------------------------------------------------------------
-  // sleep timer — WOW #5: fades out over the last stretch instead of a hard cut
-  // ------------------------------------------------------------------
+  // WOW — smooth closing: pressing the hardware/gesture back button while
+  // Now Playing (or any sheet) is open closes just that screen first, with
+  // its normal spring animation, instead of abruptly exiting the app.
+  useEffect(() => {
+    const anySheetOpen = nowPlayingOpen || contextTrackId || addSheetTrackId || infoSheetTrackId || newPlaylistSheet || bulkAddSheetOpen || showStats || showSettings || tagSheetTrackId || bulkAddSheetOpen;
+    if (anySheetOpen) {
+      window.history.pushState({ spoolSheet: true }, "");
+      const onPopState = () => {
+        setNowPlayingOpen(false); closeContext(); setAddSheetTrackId(null); setInfoSheetTrackId(null);
+        setNewPlaylistSheet(false); setBulkAddSheetOpen(false); setShowStats(false); setShowSettings(false); setTagSheetTrackId(null);
+      };
+      window.addEventListener("popstate", onPopState);
+      return () => window.removeEventListener("popstate", onPopState);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nowPlayingOpen, contextTrackId, addSheetTrackId, infoSheetTrackId, newPlaylistSheet, bulkAddSheetOpen, showStats, showSettings, tagSheetTrackId]);
+
+  // WOW — dynamic status bar / PWA chrome color that matches the playing track
+  useEffect(() => {
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", currentTrack ? accent : palette.bg);
+  }, [accent, currentTrack, palette.bg]);
+
   const setSleepMinutes = (mins) => {
-    clearTimeout(sleepTimeoutRef.current);
-    clearTimeout(sleepFadeTimeoutRef.current);
+    clearTimeout(sleepTimeoutRef.current); clearTimeout(sleepFadeTimeoutRef.current);
     if (!mins) {
       setSleepEndsAt(null); setSleepRemaining(null); setShowSleep(false);
       if (masterGainRef.current && audioCtxRef.current) masterGainRef.current.gain.setValueAtTime(1, audioCtxRef.current.currentTime);
@@ -768,42 +840,193 @@ export default function MusicPlayer() {
     setSleepEndsAt(end); setShowSleep(false);
     sleepFadeTimeoutRef.current = setTimeout(() => fadeTo(0, fadeLead), totalMs - fadeLead);
     sleepTimeoutRef.current = setTimeout(() => {
-      if (audioRef.current) audioRef.current.pause();
+      const a = deckAudio(activeDeckRef.current); if (a) a.pause();
       setIsPlaying(false); setSleepEndsAt(null); setSleepRemaining(null);
       if (masterGainRef.current && audioCtxRef.current) masterGainRef.current.gain.setValueAtTime(1, audioCtxRef.current.currentTime);
     }, totalMs);
   };
   useEffect(() => {
     if (!sleepEndsAt) return;
-    const iv = setInterval(() => {
-      const remain = Math.max(0, sleepEndsAt - Date.now());
-      setSleepRemaining(remain);
-      if (remain <= 0) clearInterval(iv);
-    }, 1000);
+    const iv = setInterval(() => { const remain = Math.max(0, sleepEndsAt - Date.now()); setSleepRemaining(remain); if (remain <= 0) clearInterval(iv); }, 1000);
     return () => clearInterval(iv);
   }, [sleepEndsAt]);
 
   // ------------------------------------------------------------------
-  // playlists
-  // ------------------------------------------------------------------
+  // WOW — milestone celebrations
+  const checkMilestone = () => {
+    const total = Object.values(playCounts).reduce((a, b) => a + b, 0) + 1;
+    const hit = MILESTONES.find((m) => m === total);
+    if (hit && !celebratedMilestones.includes(hit)) {
+      setCelebratedMilestones((prev) => [...prev, hit]);
+      setConfettiMilestone(hit);
+      showToast(`🎉 ${hit} songs played!`);
+      setTimeout(() => setConfettiMilestone(null), 2200);
+    }
+  };
+
+  // WOW — smart continue: when the queue naturally runs out, keep the
+  // vibe going instead of going silent, by queuing a few more tracks
+  // (same mood tag when available, otherwise a random pick).
+  const appendSmartContinuation = () => {
+    if (!smartContinueEnabled || library.length === 0) return false;
+    const current = library.find((t) => t.id === queue[queueIndex]);
+    const tags = current ? tagsMap[current.id] || [] : [];
+    let pool = library.filter((t) => !queue.includes(t.id));
+    if (pool.length === 0) pool = library.filter((t) => t.id !== current?.id);
+    if (pool.length === 0) return false;
+    const tagged = tags.length ? pool.filter((t) => (tagsMap[t.id] || []).some((tag) => tags.includes(tag))) : [];
+    const source = tagged.length ? tagged : pool;
+    const picks = [];
+    const copy = [...source];
+    for (let i = 0; i < Math.min(5, copy.length); i++) {
+      const idx = Math.floor(Math.random() * copy.length);
+      picks.push(copy.splice(idx, 1)[0].id);
+    }
+    setQueue((prev) => [...prev, ...picks]);
+    showToast("Continuing with similar songs");
+    return true;
+  };
+
+  // WOW — mood tags
+  const toggleTag = (trackId, tag) => {
+    setTagsMap((prev) => {
+      const cur = prev[trackId] || [];
+      const next = cur.includes(tag) ? cur.filter((x) => x !== tag) : [...cur, tag];
+      return { ...prev, [trackId]: next };
+    });
+  };
+
+  // WOW — folder import: groups files by their parent folder into playlists
+  const importFolder = async (fileList) => {
+    const files = Array.from(fileList).filter((f) => f.type.startsWith("audio/") || /\.(mp3|flac|wav|m4a|ogg|opus)$/i.test(f.name));
+    if (files.length === 0) return;
+    const byFolder = {};
+    files.forEach((f) => {
+      const rel = f.webkitRelativePath || "";
+      const parts = rel.split("/");
+      const folder = parts.length > 2 ? parts[parts.length - 2] : "Imported Folder";
+      byFolder[folder] = byFolder[folder] || [];
+      byFolder[folder].push(f);
+    });
+    await importFiles(files);
+    // give importFiles a tick to register ids, then build playlists by matching names
+    setTimeout(() => {
+      Object.entries(byFolder).forEach(([folder, folderFiles]) => {
+        const names = folderFiles.map((f) => f.name.replace(/\.[^/.]+$/, ""));
+        setLibrary((curLib) => {
+          const ids = curLib.filter((t) => names.includes(t.name)).map((t) => t.id);
+          if (ids.length) setPlaylists((prev) => [...prev, { id: uid(), name: folder, trackIds: ids }]);
+          return curLib;
+        });
+      });
+      showToast(`Created ${Object.keys(byFolder).length} playlist(s) from folders`);
+    }, 800);
+  };
+
+  // WOW — playlist backup / export & import (structure only; audio stays local)
+  const exportPlaylists = () => {
+    const data = playlists.map((p) => ({ name: p.name, tracks: p.trackIds.map((id) => library.find((t) => t.id === id)?.name).filter(Boolean) }));
+    const blob = new Blob([JSON.stringify({ app: "Spool", exportedAt: new Date().toISOString(), playlists: data }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "spool-playlists.json"; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    showToast("Playlists exported");
+  };
+  const importPlaylistsFile = async (file) => {
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      let restored = 0, missing = 0;
+      (data.playlists || []).forEach((p) => {
+        const ids = p.tracks.map((name) => library.find((t) => t.name === name)?.id).filter(Boolean);
+        missing += p.tracks.length - ids.length;
+        if (ids.length) { setPlaylists((prev) => [...prev, { id: uid(), name: p.name, trackIds: ids }]); restored++; }
+      });
+      showToast(`Restored ${restored} playlist(s)${missing ? ` — ${missing} track(s) not found in your library` : ""}`);
+    } catch { showToast("Couldn't read that backup file"); }
+  };
+
+  // WOW — storage meter
+  const refreshStorageEstimate = async () => {
+    try {
+      if (navigator.storage?.estimate) { const est = await navigator.storage.estimate(); setStorageEstimate(est); }
+    } catch { setStorageEstimate(null); }
+  };
+
+  // WOW — floating mini-player via Picture-in-Picture (renders album art into a tiny video)
+  const startFloatingPlayer = async () => {
+    try {
+      if (!currentTrack) return;
+      const canvas = pipCanvasRef.current;
+      const video = pipVideoRef.current;
+      canvas.width = 400; canvas.height = 400;
+      const ctx2d = canvas.getContext("2d");
+      const drawFrame = () => {
+        ctx2d.fillStyle = "#000"; ctx2d.fillRect(0, 0, 400, 400);
+        if (currentTrack?.artUrl) {
+          const img = new Image();
+          img.src = currentTrack.artUrl;
+          if (img.complete) ctx2d.drawImage(img, 0, 0, 400, 400);
+        } else {
+          const grad = ctx2d.createLinearGradient(0, 0, 400, 400);
+          grad.addColorStop(0, accent); grad.addColorStop(1, "#000");
+          ctx2d.fillStyle = grad; ctx2d.fillRect(0, 0, 400, 400);
+        }
+        ctx2d.fillStyle = "#fff"; ctx2d.font = "24px sans-serif";
+        ctx2d.fillText(currentTrack?.name?.slice(0, 20) || "", 16, 370);
+      };
+      drawFrame();
+      const stream = canvas.captureStream(2);
+      video.srcObject = stream;
+      await video.play();
+      if (document.pictureInPictureEnabled) await video.requestPictureInPicture();
+      else showToast("Floating player not supported on this browser");
+    } catch { showToast("Floating player not supported on this browser"); }
+  };
+
+  // WOW — shareable playlist card
+  const sharePlaylistCard = async (playlist) => {
+    try {
+      const tracks = playlist.trackIds.map((id) => library.find((t) => t.id === id)).filter(Boolean);
+      const canvas = document.createElement("canvas");
+      canvas.width = 600; canvas.height = 750;
+      const ctx2d = canvas.getContext("2d");
+      ctx2d.fillStyle = "#0A0A0A"; ctx2d.fillRect(0, 0, 600, 750);
+      tracks.slice(0, 4).forEach((t, i) => {
+        const h = artHue(t.name);
+        ctx2d.fillStyle = `hsl(${h} 70% 40%)`;
+        ctx2d.fillRect((i % 2) * 300, Math.floor(i / 2) * 300, 300, 300);
+      });
+      ctx2d.fillStyle = "#fff"; ctx2d.font = "bold 34px sans-serif";
+      ctx2d.fillText(playlist.name, 24, 660);
+      ctx2d.fillStyle = "#98989D"; ctx2d.font = "20px sans-serif";
+      ctx2d.fillText(`${tracks.length} songs · Made with Spool`, 24, 700);
+      canvas.toBlob(async (blob) => {
+        const file = new File([blob], `${playlist.name}.png`, { type: "image/png" });
+        if (navigator.share && navigator.canShare?.({ files: [file] })) {
+          await navigator.share({ files: [file], title: playlist.name });
+        } else {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a"); a.href = url; a.download = `${playlist.name}.png`; a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 2000);
+        }
+      }, "image/png");
+    } catch { showToast("Couldn't create the share card"); }
+  };
+
   const createPlaylist = () => {
     const name = newPlaylistName.trim();
     if (!name) return;
     const pl = { id: uid(), name, trackIds: [] };
     setPlaylists((prev) => [...prev, pl]);
-    setNewPlaylistName(""); setNewPlaylistSheet(false);
-    setOpenPlaylistId(pl.id);
+    setNewPlaylistName(""); setNewPlaylistSheet(false); setOpenPlaylistId(pl.id);
     showToast("Playlist created");
   };
-  const deletePlaylist = (id) => {
-    setPlaylists((prev) => prev.filter((p) => p.id !== id));
-    if (openPlaylistId === id) setOpenPlaylistId(null);
-    showToast("Playlist deleted");
-  };
+  const deletePlaylist = (id) => { setPlaylists((prev) => prev.filter((p) => p.id !== id)); if (openPlaylistId === id) setOpenPlaylistId(null); showToast("Playlist deleted"); };
   const addToPlaylist = (playlistId, trackId) => {
     setPlaylists((prev) => prev.map((p) => (p.id === playlistId && !p.trackIds.includes(trackId) ? { ...p, trackIds: [...p.trackIds, trackId] } : p)));
-    setAddSheetTrackId(null);
-    showToast("Added to playlist");
+    setAddSheetTrackId(null); showToast("Added to playlist");
   };
   const removeFromPlaylist = (playlistId, trackId) => {
     setPlaylists((prev) => prev.map((p) => (p.id === playlistId ? { ...p, trackIds: p.trackIds.filter((t) => t !== trackId) } : p)));
@@ -817,32 +1040,36 @@ export default function MusicPlayer() {
     showToast("Deleted");
   };
 
-  // ------------------------------------------------------------------
-  // Now Playing gestures — drag sheet down to dismiss, swipe art to skip
-  // ------------------------------------------------------------------
+  // WOW #5 — multi-select bulk actions
+  const toggleSelect = (id) => setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  const clearSelection = () => { setSelectMode(false); setSelectedIds([]); };
+  const bulkDelete = () => {
+    setLibrary((prev) => prev.filter((t) => !selectedIds.includes(t.id)));
+    setPlaylists((prev) => prev.map((p) => ({ ...p, trackIds: p.trackIds.filter((id) => !selectedIds.includes(id)) })));
+    setQueue((prev) => prev.filter((id) => !selectedIds.includes(id)));
+    selectedIds.forEach((id) => idbDeleteTrack(id));
+    showToast(`${selectedIds.length} deleted`);
+    clearSelection();
+  };
+  const bulkAddToPlaylist = (playlistId) => {
+    setPlaylists((prev) => prev.map((p) => (p.id === playlistId ? { ...p, trackIds: Array.from(new Set([...p.trackIds, ...selectedIds])) } : p)));
+    showToast("Added to playlist");
+    setBulkAddSheetOpen(false);
+    clearSelection();
+  };
+  const bulkPlay = () => {
+    const tracks = library.filter((t) => selectedIds.includes(t.id));
+    if (tracks.length) playFrom(tracks, 0, "Selected");
+    clearSelection();
+  };
+
   const onSheetTouchStart = (e) => { touchStartY.current = e.touches[0].clientY; setDragging(true); };
   const onSheetTouchMove = (e) => { const dy = e.touches[0].clientY - touchStartY.current; if (dy > 0) setDragY(dy); };
   const onSheetTouchEnd = () => { setDragging(false); if (dragY > 110) setNowPlayingOpen(false); setDragY(0); };
-
   const onArtTouchStart = (e) => { artTouchStartX.current = e.touches[0].clientX; };
   const onArtTouchMove = (e) => { setArtSwipeX(e.touches[0].clientX - artTouchStartX.current); };
-  const onArtTouchEnd = () => {
-    if (artSwipeX < -70) stepTrack(1);
-    else if (artSwipeX > 70) stepTrack(-1);
-    setArtSwipeX(0);
-  };
+  const onArtTouchEnd = () => { if (artSwipeX < -70) stepTrack(1); else if (artSwipeX > 70) stepTrack(-1); setArtSwipeX(0); };
 
-  // ---- Vinyl Mode gestures: tap record to play/pause, swipe to skip ----
-  const onVinylTouchStart = (e) => { vinylTouchStartX.current = e.touches[0].clientX; };
-  const onVinylTouchMove = (e) => { setVinylSwipeX(e.touches[0].clientX - vinylTouchStartX.current); };
-  const onVinylTouchEnd = () => {
-    if (vinylSwipeX < -60) { stepTrack(1); if (navigator.vibrate) navigator.vibrate(15); }
-    else if (vinylSwipeX > 60) { stepTrack(-1); if (navigator.vibrate) navigator.vibrate(15); }
-    setVinylSwipeX(0);
-  };
-  const onVinylTap = () => { togglePlay(); if (navigator.vibrate) navigator.vibrate(isPlaying ? 8 : [8, 30, 8]); };
-
-  // ------------------------------------------------------------------
   const q = searchQuery.trim().toLowerCase();
   const searchLibraryResults = q ? library.filter((t) => t.name.toLowerCase().includes(q)) : [];
   const searchPlaylistResults = q
@@ -854,7 +1081,7 @@ export default function MusicPlayer() {
 
   // ==================================================================
   return (
-    <div className="fixed inset-0 flex flex-col overflow-hidden select-none" style={{ background: "#000000", color: "#FFFFFF", fontFamily: "-apple-system, BlinkMacSystemFont, 'Inter', sans-serif" }}>
+    <div className="fixed inset-0 flex flex-col overflow-hidden select-none" style={{ background: palette.bg, color: palette.text, fontFamily: "-apple-system, BlinkMacSystemFont, 'Inter', sans-serif" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
         input[type="range"] { -webkit-appearance:none; appearance:none; height:4px; background:rgba(255,255,255,0.2); border-radius:999px; outline:none; }
@@ -872,26 +1099,35 @@ export default function MusicPlayer() {
         .hscroll > * { scroll-snap-align: start; }
         .fade-in { animation: fadeIn 0.2s ease-out; }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-        @keyframes vinylSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
       `}</style>
 
-      {toast && (
-        <div className="fade-in absolute top-3 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs font-medium" style={{ background: "rgba(40,40,42,0.95)", zIndex: 70, backdropFilter: "blur(20px)" }}>{toast}</div>
-      )}
+      {toast && <div className="fade-in absolute top-3 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs font-medium" style={{ background: "rgba(40,40,42,0.95)", zIndex: 70, backdropFilter: "blur(20px)" }}>{toast}</div>}
 
-      <header className="flex items-center justify-between px-4 shrink-0" style={{ height: 54 }}>
+      <header className="flex items-center justify-between px-4 shrink-0" style={{ height: 54, background: palette.bg, color: palette.text }}>
         <h1 className="text-2xl font-extrabold tracking-tight">{activeTab === "home" ? "Home" : activeTab === "library" ? (openPlaylistId ? "" : "Library") : "Search"}</h1>
         {!openPlaylistId && (
-          <button onClick={() => fileInputRef.current?.click()} className="press p-2 rounded-full" style={{ background: "rgba(255,255,255,0.1)" }}><Upload size={17} /></button>
+          <div className="flex items-center gap-2">
+            {activeTab === "home" && (
+              <>
+                <button onClick={() => setShowStats(true)} className="press p-2 rounded-full" style={{ background: palette.surface }}><TrendingUp size={16} /></button>
+                <button onClick={() => { setShowSettings(true); refreshStorageEstimate(); }} className="press p-2 rounded-full" style={{ background: palette.surface }}><Settings size={16} /></button>
+              </>
+            )}
+            <button onClick={() => fileInputRef.current?.click()} className="press p-2 rounded-full" style={{ background: palette.surface }}><Upload size={17} /></button>
+          </div>
         )}
         {openPlaylistId && (
-          <button onClick={() => setOpenPlaylistId(null)} className="press flex items-center gap-1 text-sm font-medium" style={{ color: "#FA2D48" }}><ArrowLeft size={18} /> Library</button>
+          <div className="flex items-center gap-3">
+            <button onClick={() => sharePlaylistCard(activePlaylist)} className="press p-1.5"><Share2 size={18} /></button>
+            <button onClick={() => setOpenPlaylistId(null)} className="press flex items-center gap-1 text-sm font-medium" style={{ color: "#FA2D48" }}><ArrowLeft size={18} /> Library</button>
+          </div>
         )}
         <input ref={fileInputRef} type="file" accept="audio/*" multiple onChange={onFileInputChange} className="hidden" />
+        <input ref={folderInputRef} type="file" accept="audio/*" multiple webkitdirectory="" directory="" onChange={(e) => { if (e.target.files?.length) importFolder(e.target.files); e.target.value = ""; }} className="hidden" />
+        <input ref={backupInputRef} type="file" accept="application/json" onChange={(e) => { if (e.target.files?.[0]) importPlaylistsFile(e.target.files[0]); e.target.value = ""; }} className="hidden" />
       </header>
 
-      <main className="flex-1 overflow-y-auto px-4" style={{ paddingBottom: currentTrack ? 148 : 78 }}
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={onDrop}>
+      <main className="flex-1 overflow-y-auto px-4" style={{ paddingBottom: currentTrack ? 148 : 78, background: palette.bg, color: palette.text }} onDragOver={(e) => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={onDrop}>
         {activeTab === "home" && (
           <div className="flex flex-col gap-6 pt-1">
             {library.length === 0 ? (
@@ -899,6 +1135,7 @@ export default function MusicPlayer() {
             ) : (
               <>
                 <HomeRow title="Recently Added" tracks={recentlyAdded} onPlay={(i) => playFrom(recentlyAdded, i, "Recently Added")} />
+                {likedTracks.length > 0 && <HomeRow title="Favorites" icon={<Heart size={14} />} tracks={likedTracks} onPlay={(i) => playFrom(likedTracks, i, "Favorites")} />}
                 {recentlyPlayedTracks.length > 0 && <HomeRow title="Recently Played" icon={<Clock size={14} />} tracks={recentlyPlayedTracks} onPlay={(i) => playFrom(recentlyPlayedTracks, i, "Recently Played")} />}
                 {mostPlayed.length > 0 && <HomeRow title="Most Played" icon={<TrendingUp size={14} />} tracks={mostPlayed} onPlay={(i) => playFrom(mostPlayed, i, "Most Played")} />}
                 {playlists.length > 0 && (
@@ -907,7 +1144,7 @@ export default function MusicPlayer() {
                     <div className="hscroll pb-2">
                       {playlists.map((p) => (
                         <button key={p.id} onClick={() => { setActiveTab("library"); setOpenPlaylistId(p.id); }} className="press shrink-0 w-32 text-left">
-                          <div className="w-32 h-32 rounded-xl flex items-center justify-center mb-2" style={{ background: "#1C1C1E" }}><ListMusic size={26} color="#FA2D48" /></div>
+                          <div className="w-32 h-32 rounded-xl flex items-center justify-center mb-2" style={{ background: palette.surface }}><ListMusic size={26} color={palette.accent} /></div>
                           <div className="text-sm font-medium truncate">{p.name}</div>
                           <div className="text-xs" style={{ color: "#98989D" }}>{p.trackIds.length} songs</div>
                         </button>
@@ -924,25 +1161,35 @@ export default function MusicPlayer() {
           <div>
             <div className="flex items-center gap-2 mb-3 pt-1">
               <button onClick={() => setNewPlaylistSheet(true)} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium" style={{ background: "rgba(250,45,72,0.15)", color: "#FA2D48" }}><Plus size={14} /> Playlist</button>
+              <button onClick={() => { setSelectMode((s) => !s); setSelectedIds([]); }} className="press px-3 py-1.5 rounded-full text-xs font-medium" style={{ background: selectMode ? palette.accent : palette.surface2, color: selectMode ? "#fff" : palette.subtext }}>{selectMode ? "Done" : "Select"}</button>
               <div className="flex-1" />
-              <button onClick={() => setLibraryView((v) => (v === "list" ? "grid" : "list"))} className="press p-2 rounded-full" style={{ background: "rgba(255,255,255,0.08)" }}>{libraryView === "list" ? <LayoutGrid size={15} /> : <ListIcon size={15} />}</button>
-              <div className="relative">
-                <button onClick={() => setShowSortMenu((s) => !s)} className="press p-2 rounded-full" style={{ background: "rgba(255,255,255,0.08)" }}><ArrowUpDown size={15} /></button>
-                {showSortMenu && (
-                  <div className="absolute right-0 top-10 rounded-xl py-1 w-40 fade-in" style={{ background: "#2C2C2E", zIndex: 30 }}>
-                    {[["recent", "Recently Added"], ["name", "Name"], ["duration", "Duration"]].map(([k, l]) => (
-                      <button key={k} onClick={() => { setLibrarySort(k); setShowSortMenu(false); }} className="block w-full text-left px-4 py-2 text-xs" style={{ color: librarySort === k ? "#FA2D48" : "#FFFFFF" }}>{l}</button>
-                    ))}
-                  </div>
-                )}
-              </div>
+              {!selectMode && (<>
+                <button onClick={() => setLibraryView((v) => (v === "list" ? "grid" : "list"))} className="press p-2 rounded-full" style={{ background: palette.surface2, color: palette.text }}>{libraryView === "list" ? <LayoutGrid size={15} /> : <ListIcon size={15} />}</button>
+                <div className="relative">
+                  <button onClick={() => setShowSortMenu((s) => !s)} className="press p-2 rounded-full" style={{ background: palette.surface2, color: palette.text }}><ArrowUpDown size={15} /></button>
+                  {showSortMenu && (
+                    <div className="absolute right-0 top-10 rounded-xl py-1 w-40 fade-in" style={{ background: palette.surface2, zIndex: 30 }}>
+                      {[["recent", "Recently Added"], ["name", "Name"], ["duration", "Duration"]].map(([k, l]) => (<button key={k} onClick={() => { setLibrarySort(k); setShowSortMenu(false); }} className="block w-full text-left px-4 py-2 text-xs" style={{ color: librarySort === k ? palette.accent : palette.text }}>{l}</button>))}
+                    </div>
+                  )}
+                </div>
+              </>)}
             </div>
 
-            {playlists.length > 0 && (
+            {!selectMode && (
+              <div className="hscroll pb-3">
+                <button onClick={() => setActiveTagFilter(null)} className="press px-3 py-1.5 rounded-full text-xs font-medium shrink-0" style={{ background: !activeTagFilter ? palette.accent : palette.surface2, color: !activeTagFilter ? "#fff" : palette.subtext }}>All</button>
+                {MOOD_TAGS.map((tag) => (
+                  <button key={tag} onClick={() => setActiveTagFilter(activeTagFilter === tag ? null : tag)} className="press px-3 py-1.5 rounded-full text-xs font-medium shrink-0" style={{ background: activeTagFilter === tag ? palette.accent : palette.surface2, color: activeTagFilter === tag ? "#fff" : palette.subtext }}>{tag}</button>
+                ))}
+              </div>
+            )}
+
+            {!selectMode && playlists.length > 0 && (
               <div className="hscroll pb-3">
                 {playlists.map((p) => (
                   <button key={p.id} onClick={() => setOpenPlaylistId(p.id)} className="press shrink-0 w-28 text-left">
-                    <div className="w-28 h-28 rounded-xl flex items-center justify-center mb-1.5" style={{ background: "#1C1C1E" }}><ListMusic size={22} color="#FA2D48" /></div>
+                    <div className="w-28 h-28 rounded-xl flex items-center justify-center mb-1.5" style={{ background: palette.surface }}><ListMusic size={22} color={palette.accent} /></div>
                     <div className="text-xs font-medium truncate">{p.name}</div>
                   </button>
                 ))}
@@ -951,7 +1198,7 @@ export default function MusicPlayer() {
 
             {sortedLibrary.length === 0 ? (
               <EmptyState dragOver={dragOver} message="Drag audio files anywhere, or tap the upload icon above. Nothing is re-encoded — original quality stays intact." />
-            ) : libraryView === "grid" ? (
+            ) : libraryView === "grid" && !selectMode ? (
               <div className="grid grid-cols-3 gap-3 mt-1">
                 {sortedLibrary.map((t, i) => (
                   <button key={t.id} onClick={() => playFrom(sortedLibrary, i, "Library")} className="press text-left">
@@ -963,7 +1210,9 @@ export default function MusicPlayer() {
             ) : (
               <div className="mt-1">
                 {sortedLibrary.map((t, i) => (
-                  <TrackRow key={t.id} t={t} isCurrent={t.id === currentTrack?.id} isPlaying={isPlaying}
+                  <TrackRow key={t.id} t={t} isCurrent={t.id === currentTrack?.id} isPlaying={isPlaying} palette={palette}
+                    selectMode={selectMode} selected={selectedIds.includes(t.id)} onToggleSelect={() => toggleSelect(t.id)}
+                    liked={likedIds.includes(t.id)}
                     onTap={() => playFrom(sortedLibrary, i, "Library")} onMenu={() => openContext(t.id, "library")} onSwipeDelete={() => deleteFromLibrary(t.id)} />
                 ))}
               </div>
@@ -974,18 +1223,15 @@ export default function MusicPlayer() {
         {activeTab === "library" && openPlaylistId && (
           <div className="pt-1">
             <div className="flex items-center gap-3 mb-4">
-              <div className="w-20 h-20 rounded-xl flex items-center justify-center shrink-0" style={{ background: "#1C1C1E" }}><ListMusic size={30} color="#FA2D48" /></div>
-              <div>
-                <div className="text-xl font-extrabold">{activePlaylist?.name}</div>
-                <div className="text-xs" style={{ color: "#98989D" }}>{playlistTracks.length} songs</div>
-              </div>
+              <div className="w-20 h-20 rounded-xl flex items-center justify-center shrink-0" style={{ background: palette.surface }}><ListMusic size={30} color={palette.accent} /></div>
+              <div><div className="text-xl font-extrabold">{activePlaylist?.name}</div><div className="text-xs" style={{ color: "#98989D" }}>{playlistTracks.length} songs</div></div>
               <button onClick={() => deletePlaylist(openPlaylistId)} className="press ml-auto p-2" style={{ color: "#7A3A22" }}><Trash2 size={17} /></button>
             </div>
             {playlistTracks.length === 0 ? (
               <EmptyState dragOver={false} message="This playlist is empty. Go to a track's ⋯ menu in Library to add it here." />
             ) : (
               playlistTracks.map((t, i) => (
-                <TrackRow key={t.id} t={t} isCurrent={t.id === currentTrack?.id} isPlaying={isPlaying}
+                <TrackRow key={t.id} t={t} isCurrent={t.id === currentTrack?.id} isPlaying={isPlaying} palette={palette} liked={likedIds.includes(t.id)}
                   onTap={() => playFrom(playlistTracks, i, activePlaylist.name)} onMenu={() => openContext(t.id, "playlist", openPlaylistId)} onSwipeDelete={() => removeFromPlaylist(openPlaylistId, t.id)} />
               ))
             )}
@@ -994,30 +1240,24 @@ export default function MusicPlayer() {
 
         {activeTab === "search" && (
           <div className="pt-1">
-            <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl mb-4" style={{ background: "#1C1C1E" }}>
-              <Search size={15} color="#98989D" />
-              <input autoFocus value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Artists, Songs, Playlists" className="bg-transparent outline-none text-sm flex-1" style={{ color: "#FFFFFF" }} />
-              {searchQuery && <button onClick={() => setSearchQuery("")}><X size={15} color="#98989D" /></button>}
+            <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl mb-4" style={{ background: palette.surface }}>
+              <Search size={15} color={palette.subtext} />
+              <input autoFocus value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Artists, Songs, Playlists" className="bg-transparent outline-none text-sm flex-1" style={{ color: palette.text }} />
+              {searchQuery && <button onClick={() => setSearchQuery("")}><X size={15} color={palette.subtext} /></button>}
             </div>
-            {!q ? (
-              <div className="text-sm text-center py-16" style={{ color: "#98989D" }}>Search your library and playlists</div>
-            ) : (
+            {!q ? (<div className="text-sm text-center py-16" style={{ color: palette.subtext }}>Search your library and playlists</div>) : (
               <>
-                {searchLibraryResults.length === 0 && searchPlaylistResults.length === 0 && <div className="text-sm text-center py-16" style={{ color: "#98989D" }}>No results for "{searchQuery}"</div>}
+                {searchLibraryResults.length === 0 && searchPlaylistResults.length === 0 && <div className="text-sm text-center py-16" style={{ color: palette.subtext }}>No results for "{searchQuery}"</div>}
                 {searchLibraryResults.length > 0 && (
                   <div className="mb-5">
                     <div className="text-xs font-semibold tracking-wide mb-1" style={{ color: "#98989D" }}>LIBRARY</div>
-                    {searchLibraryResults.map((t, i) => (
-                      <TrackRow key={t.id} t={t} isCurrent={t.id === currentTrack?.id} isPlaying={isPlaying} onTap={() => playFrom(searchLibraryResults, i, "Search")} onMenu={() => openContext(t.id, "library")} />
-                    ))}
+                    {searchLibraryResults.map((t, i) => (<TrackRow key={t.id} t={t} isCurrent={t.id === currentTrack?.id} isPlaying={isPlaying} palette={palette} liked={likedIds.includes(t.id)} onTap={() => playFrom(searchLibraryResults, i, "Search")} onMenu={() => openContext(t.id, "library")} />))}
                   </div>
                 )}
                 {searchPlaylistResults.map(({ playlist, tracks }) => (
                   <div key={playlist.id} className="mb-5">
                     <div className="text-xs font-semibold tracking-wide mb-1" style={{ color: "#98989D" }}>{playlist.name.toUpperCase()}</div>
-                    {tracks.map((t, i) => (
-                      <TrackRow key={t.id} t={t} isCurrent={t.id === currentTrack?.id} isPlaying={isPlaying} onTap={() => playFrom(tracks, i, playlist.name)} onMenu={() => openContext(t.id, "playlist", playlist.id)} />
-                    ))}
+                    {tracks.map((t, i) => (<TrackRow key={t.id} t={t} isCurrent={t.id === currentTrack?.id} isPlaying={isPlaying} palette={palette} liked={likedIds.includes(t.id)} onTap={() => playFrom(tracks, i, playlist.name)} onMenu={() => openContext(t.id, "playlist", playlist.id)} />))}
                   </div>
                 ))}
               </>
@@ -1026,32 +1266,36 @@ export default function MusicPlayer() {
         )}
       </main>
 
-      {currentTrack && !nowPlayingOpen && (
-        <div onClick={() => setNowPlayingOpen(true)} className="press absolute left-2 right-2 flex items-center gap-3 px-3 rounded-2xl fade-in" style={{ bottom: 66, height: 60, background: "rgba(44,44,46,0.85)", backdropFilter: "blur(24px)", zIndex: 20 }}>
+      {currentTrack && !nowPlayingOpen && !selectMode && (
+        <div onClick={() => setNowPlayingOpen(true)} className="press absolute left-2 right-2 flex items-center gap-3 px-3 rounded-2xl fade-in" style={{ bottom: 66, height: 60, background: glassPanel, backdropFilter: "blur(24px)", zIndex: 20 }}>
           <ArtBox track={currentTrack} className="w-9 h-9 rounded-lg shrink-0" />
           <div className="flex-1 min-w-0 text-left"><div className="text-sm font-medium truncate">{currentTrack.name}</div></div>
-          {isPlaying && (
-            <div className="flex items-end gap-0.5 h-4 shrink-0">
-              <div className="eq-bar" style={{ animationDelay: "0s" }} /><div className="eq-bar" style={{ animationDelay: "0.2s" }} /><div className="eq-bar" style={{ animationDelay: "0.4s" }} />
-            </div>
-          )}
+          {isPlaying && <div className="flex items-end gap-0.5 h-4 shrink-0"><div className="eq-bar" style={{ animationDelay: "0s" }} /><div className="eq-bar" style={{ animationDelay: "0.2s" }} /><div className="eq-bar" style={{ animationDelay: "0.4s" }} /></div>}
           <button onClick={(e) => { e.stopPropagation(); togglePlay(); }} className="press p-1.5 shrink-0">{isPlaying ? <Pause size={22} fill="#FFFFFF" /> : <Play size={22} fill="#FFFFFF" style={{ marginLeft: 2 }} />}</button>
           <button onClick={(e) => { e.stopPropagation(); stepTrack(1); }} className="press p-1.5 shrink-0"><SkipForward size={20} fill="#FFFFFF" /></button>
         </div>
       )}
 
-      <nav className="absolute left-0 right-0 bottom-0 flex items-stretch" style={{ height: 66, background: "rgba(20,20,22,0.85)", backdropFilter: "blur(24px)", borderTop: "1px solid rgba(255,255,255,0.08)", zIndex: 21 }}>
+      {selectMode && (
+        <div className="absolute left-2 right-2 flex items-center gap-2 px-3 rounded-2xl fade-in" style={{ bottom: 66, height: 60, background: glassPanel, backdropFilter: "blur(24px)", zIndex: 20 }}>
+          <button onClick={clearSelection} className="press p-2"><X size={20} /></button>
+          <span className="text-sm font-medium flex-1">{selectedIds.length} selected</span>
+          <button onClick={bulkPlay} disabled={!selectedIds.length} className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><Play size={20} fill="#fff" /></button>
+          <button onClick={() => setBulkAddSheetOpen(true)} disabled={!selectedIds.length} className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><ListPlus size={20} /></button>
+          <button onClick={bulkDelete} disabled={!selectedIds.length} className="press p-2" style={{ color: "#FF453A", opacity: selectedIds.length ? 1 : 0.35 }}><Trash2 size={20} /></button>
+        </div>
+      )}
+
+      <nav className="absolute left-0 right-0 bottom-0 flex items-stretch" style={{ height: 66, background: glassBar, backdropFilter: "blur(24px)", borderTop: `1px solid ${theme === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.08)"}`, zIndex: 21 }}>
         {[["home", "Home", <Home size={22} />], ["library", "Library", <LibraryIcon size={22} />], ["search", "Search", <Search size={22} />]].map(([key, label, icon]) => (
-          <button key={key} onClick={() => { setActiveTab(key); if (key !== "library") setOpenPlaylistId(null); }} className="press flex-1 flex flex-col items-center justify-center gap-1" style={{ color: activeTab === key ? "#FA2D48" : "#98989D" }}>
-            {icon}<span className="text-[10px] font-medium">{label}</span>
-          </button>
+          <button key={key} onClick={() => { setActiveTab(key); if (key !== "library") setOpenPlaylistId(null); clearSelection(); }} className="press flex-1 flex flex-col items-center justify-center gap-1" style={{ color: activeTab === key ? "#FA2D48" : "#98989D" }}>{icon}<span className="text-[10px] font-medium">{label}</span></button>
         ))}
       </nav>
 
       {nowPlayingOpen && currentTrack && (
         <div className="sheet-enter absolute inset-0 flex flex-col overflow-hidden" style={{ zIndex: 60, transform: `translateY(${dragY}px)`, transition: dragging ? "none" : `transform 0.3s ${SPRING}` }}>
           <div className="absolute inset-0" style={{ background: "#0A0A0A" }} />
-          <div ref={bgGlowRef} className="absolute" style={{ top: "-20%", left: "-20%", width: "140%", height: "70%", background: artGradient(currentTrack.name), filter: "blur(90px)", opacity: 0.55, transition: "transform 0.08s linear, opacity 0.08s linear" }} />
+          <div ref={bgGlowRef} className="absolute" style={{ top: "-20%", left: "-20%", width: "140%", height: "70%", background: themeColor ? `radial-gradient(circle, rgb(${themeColor.r},${themeColor.g},${themeColor.b}), transparent 70%)` : artGradient(currentTrack.name), filter: "blur(90px)", opacity: 0.55, transition: "transform 0.08s linear, opacity 0.08s linear" }} />
           <div className="absolute inset-0" style={{ background: "linear-gradient(180deg, transparent, rgba(0,0,0,0.6) 55%, #0A0A0A 90%)" }} />
 
           <div className="relative flex flex-col h-full" onTouchStart={onSheetTouchStart} onTouchMove={onSheetTouchMove} onTouchEnd={onSheetTouchEnd}>
@@ -1059,19 +1303,40 @@ export default function MusicPlayer() {
             <div className="flex items-center justify-between px-5 shrink-0" style={{ height: 44 }}>
               <button onClick={() => setNowPlayingOpen(false)} className="press p-1"><ChevronDown size={22} /></button>
               <div className="text-center"><div className="text-[10px] tracking-wider" style={{ color: "#98989D" }}>PLAYING FROM</div><div className="text-xs font-semibold">{queueSource}</div></div>
-              <button onClick={() => setInfoSheetTrackId(currentTrack.id)} className="press p-1"><Info size={19} /></button>
+              <div className="flex items-center gap-3">
+                <button onClick={() => setVinylMode((v) => !v)} className="press p-1"><Disc3 size={19} color={vinylMode ? accent : "#FFFFFF"} /></button>
+                <button onClick={startFloatingPlayer} className="press p-1"><PictureInPicture2 size={17} /></button>
+                <button onClick={() => toggleLike(currentTrack.id)} className="press p-1"><Heart size={19} color={likedIds.includes(currentTrack.id) ? accent : "#FFFFFF"} fill={likedIds.includes(currentTrack.id) ? accent : "none"} /></button>
+                <button onClick={() => setInfoSheetTrackId(currentTrack.id)} className="press p-1"><Info size={19} /></button>
+              </div>
             </div>
 
             {npView === "player" && (
               <div className="flex-1 flex flex-col items-center justify-center px-8 gap-6 overflow-y-auto">
-                <div
-                  className="w-full max-w-xs aspect-square rounded-2xl overflow-hidden shadow-2xl"
-                  onTouchStart={onArtTouchStart} onTouchMove={onArtTouchMove} onTouchEnd={onArtTouchEnd}
-                  style={{ transform: `translateX(${artSwipeX}px)`, transition: artSwipeX === 0 ? `transform 0.25s ${SPRING}` : "none" }}
-                >
-                  <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">
-                    {!currentTrack.artUrl && <Disc3 size={70} color="rgba(255,255,255,0.55)" className={isPlaying ? "animate-spin" : ""} style={{ animationDuration: "4s" }} />}
-                  </ArtBox>
+                <div className="w-full max-w-xs aspect-square rounded-2xl overflow-hidden shadow-2xl" onTouchStart={onArtTouchStart} onTouchMove={onArtTouchMove} onTouchEnd={onArtTouchEnd}
+                  style={{ transform: `translateX(${artSwipeX}px)`, transition: artSwipeX === 0 ? `transform 0.25s ${SPRING}` : "none" }}>
+                  {vinylMode ? (
+                    <div className="w-full h-full flex items-center justify-center" style={{ background: "radial-gradient(circle, #2a2a2a 0%, #0a0a0a 70%)" }}>
+                      <div className="rounded-full relative" style={{
+                        width: "88%", height: "88%",
+                        background: "repeating-radial-gradient(circle, #1a1a1a 0px, #1a1a1a 2px, #262626 3px, #1a1a1a 4px)",
+                        animation: isPlaying ? "spin 3.5s linear infinite" : "none",
+                        boxShadow: "0 10px 40px rgba(0,0,0,0.6)",
+                      }}>
+                        <div className="absolute rounded-full overflow-hidden" style={{ width: "38%", height: "38%", top: "31%", left: "31%", boxShadow: "0 0 0 3px #0a0a0a" }}>
+                          <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">
+                            {!currentTrack.artUrl && <Disc3 size={30} color="rgba(255,255,255,0.5)" />}
+                          </ArtBox>
+                        </div>
+                        <div className="absolute rounded-full" style={{ width: 10, height: 10, top: "50%", left: "50%", transform: "translate(-50%,-50%)", background: "#0a0a0a" }} />
+                      </div>
+                      <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+                    </div>
+                  ) : (
+                    <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">
+                      {!currentTrack.artUrl && <Disc3 size={70} color="rgba(255,255,255,0.55)" className={isPlaying ? "animate-spin" : ""} style={{ animationDuration: "4s" }} />}
+                    </ArtBox>
+                  )}
                 </div>
 
                 <div className="text-center w-full">
@@ -1086,13 +1351,11 @@ export default function MusicPlayer() {
                 </div>
 
                 <div className="flex items-center gap-6">
-                  <button onClick={() => setShuffle((s) => !s)} className="press" style={{ color: shuffle ? "#FA2D48" : "#98989D" }}><Shuffle size={19} /></button>
+                  <button onClick={() => setShuffle((s) => !s)} className="press" style={{ color: shuffle ? accent : "#98989D" }}><Shuffle size={19} /></button>
                   <button onClick={() => stepTrack(-1)} className="press"><SkipBack size={28} fill="#FFFFFF" /></button>
-                  <button onClick={togglePlay} className="press w-16 h-16 rounded-full flex items-center justify-center" style={{ background: "#FFFFFF" }}>
-                    {isPlaying ? <Pause size={26} color="#000000" fill="#000000" /> : <Play size={26} color="#000000" fill="#000000" style={{ marginLeft: 3 }} />}
-                  </button>
+                  <button onClick={togglePlay} className="press w-16 h-16 rounded-full flex items-center justify-center" style={{ background: "#FFFFFF" }}>{isPlaying ? <Pause size={26} color="#000000" fill="#000000" /> : <Play size={26} color="#000000" fill="#000000" style={{ marginLeft: 3 }} />}</button>
                   <button onClick={() => stepTrack(1)} className="press"><SkipForward size={28} fill="#FFFFFF" /></button>
-                  <button onClick={cycleRepeat} className="press" style={{ color: repeatMode !== "off" ? "#FA2D48" : "#98989D" }}>{repeatMode === "one" ? <Repeat1 size={19} /> : <Repeat size={19} />}</button>
+                  <button onClick={cycleRepeat} className="press" style={{ color: repeatMode !== "off" ? accent : "#98989D" }}>{repeatMode === "one" ? <Repeat1 size={19} /> : <Repeat size={19} />}</button>
                 </div>
 
                 <canvas ref={vuCanvasRef} width={140} height={26} />
@@ -1102,23 +1365,29 @@ export default function MusicPlayer() {
                   <input type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} onChange={onVolumeChange} className="flex-1" />
                 </div>
 
-                <div className="flex items-center gap-8 pb-2 overflow-x-auto hscroll" style={{ paddingLeft: 4, paddingRight: 4 }}>
-                  <button onClick={() => setVinylMode(true)} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: "#98989D" }}><Disc3 size={18} /><span className="text-[10px]">Vinyl Mode</span></button>
-                  <button onClick={() => setNpView("lyrics")} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: "#98989D" }}><Mic2 size={18} /><span className="text-[10px]">Lyrics</span></button>
-                  <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); }} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: sleepEndsAt ? "#FA2D48" : "#98989D" }}><Moon size={18} /><span className="text-[10px]">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
-                  <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); }} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? "#FA2D48" : "#98989D" }}><SlidersHorizontal size={18} /><span className="text-[10px]">EQ</span></button>
-                  <button onClick={() => setNpView("queue")} className="press shrink-0 flex flex-col items-center gap-1" style={{ color: "#98989D" }}><ListMusic size={18} /><span className="text-[10px]">Up Next</span></button>
+                <div className="flex items-center gap-10 pb-2">
+                  <button onClick={() => setNpView("lyrics")} className="press flex flex-col items-center gap-1" style={{ color: "#98989D" }}><Mic2 size={18} /><span className="text-[10px]">Lyrics</span></button>
+                  <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); }} className="press flex flex-col items-center gap-1" style={{ color: sleepEndsAt ? accent : "#98989D" }}><Moon size={18} /><span className="text-[10px]">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
+                  <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); }} className="press flex flex-col items-center gap-1" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? accent : "#98989D" }}><SlidersHorizontal size={18} /><span className="text-[10px]">EQ</span></button>
+                  <button onClick={() => setNpView("queue")} className="press flex flex-col items-center gap-1" style={{ color: "#98989D" }}><ListMusic size={18} /><span className="text-[10px]">Up Next</span></button>
                 </div>
 
                 {showEq && (
-                  <div className="flex items-end gap-6 px-6 py-4 rounded-xl" style={{ background: "rgba(28,28,30,0.9)" }}>
-                    {[["bass", "BASS"], ["mid", "MID"], ["treble", "TREB"]].map(([key, label]) => (
-                      <div key={key} className="flex flex-col items-center gap-2">
-                        <span className="text-xs" style={{ color: "#FA2D48" }}>{eqBands[key] > 0 ? `+${eqBands[key]}` : eqBands[key]}</span>
-                        <input type="range" className="vert" min={-12} max={12} step={1} value={eqBands[key]} onChange={(e) => setEqBands((b) => ({ ...b, [key]: Number(e.target.value) }))} />
-                        <span className="text-xs tracking-widest" style={{ color: "#98989D" }}>{label}</span>
-                      </div>
-                    ))}
+                  <div className="flex flex-col items-center gap-3 px-6 py-4 rounded-xl" style={{ background: "rgba(28,28,30,0.9)" }}>
+                    <div className="flex gap-2">
+                      {Object.keys(EQ_PRESETS).map((name) => (
+                        <button key={name} onClick={() => { setEqBands(EQ_PRESETS[name]); setEqPreset(name); }} className="press px-3 py-1 rounded-full text-xs" style={{ background: eqPreset === name ? accent : "rgba(255,255,255,0.1)", color: eqPreset === name ? "#fff" : "#98989D" }}>{name}</button>
+                      ))}
+                    </div>
+                    <div className="flex items-end gap-6 pt-1">
+                      {[["bass", "BASS"], ["mid", "MID"], ["treble", "TREB"]].map(([key, label]) => (
+                        <div key={key} className="flex flex-col items-center gap-2">
+                          <span className="text-xs" style={{ color: accent }}>{eqBands[key] > 0 ? `+${eqBands[key]}` : eqBands[key]}</span>
+                          <input type="range" className="vert" min={-12} max={12} step={1} value={eqBands[key]} onChange={(e) => { setEqBands((b) => ({ ...b, [key]: Number(e.target.value) })); setEqPreset("Custom"); }} />
+                          <span className="text-xs tracking-widest" style={{ color: "#98989D" }}>{label}</span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
                 {showSleep && (
@@ -1144,10 +1413,7 @@ export default function MusicPlayer() {
                       className="flex items-center gap-3 px-3 py-2.5" style={{ background: i === queueIndex ? "rgba(250,45,72,0.12)" : "transparent", borderRadius: 10 }}>
                       <GripVertical size={14} color="#5A5A5C" />
                       <ArtBox track={t} className="w-9 h-9 rounded-md shrink-0" />
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm truncate" style={{ color: i === queueIndex ? "#FA2D48" : "#FFFFFF" }}>{t.name}</div>
-                        <div className="text-xs" style={{ color: "#98989D" }}>{t.ext}</div>
-                      </div>
+                      <div className="flex-1 min-w-0"><div className="text-sm truncate" style={{ color: i === queueIndex ? accent : "#FFFFFF" }}>{t.name}</div><div className="text-xs" style={{ color: "#98989D" }}>{t.ext}</div></div>
                       {i !== queueIndex && <button onClick={() => removeFromQueue(i)} className="press p-1.5" style={{ color: "#7A3A22" }}><X size={15} /></button>}
                     </div>
                   );
@@ -1155,113 +1421,21 @@ export default function MusicPlayer() {
               </div>
             )}
 
-            {npView === "lyrics" && (
-              <LyricsPanel track={currentTrack} text={lyricsMap[currentTrack.id] || ""} onSave={(text) => setLyricsMap((prev) => ({ ...prev, [currentTrack.id]: text }))} onBack={() => setNpView("player")} />
-            )}
+            {npView === "lyrics" && <LyricsPanel track={currentTrack} text={lyricsMap[currentTrack.id] || ""} onSave={(text) => setLyricsMap((prev) => ({ ...prev, [currentTrack.id]: text }))} onBack={() => setNpView("player")} />}
           </div>
         </div>
       )}
 
-      {vinylMode && currentTrack && (() => {
-        const accent = ACCENTS[accentIdx].hex;
-        return (
-          <div className="fade-in absolute inset-0 flex flex-col overflow-hidden select-none" style={{ zIndex: 90, background: "#000000" }}>
-            <div className="absolute inset-0" style={{ background: artGradient(currentTrack.name), filter: "blur(110px)", opacity: 0.4 }} />
-            <div className="absolute inset-0" style={{ background: `radial-gradient(circle at 50% 15%, ${accent}22, transparent 60%)` }} />
-            <div className="absolute inset-0" style={{ background: "linear-gradient(180deg, rgba(0,0,0,0.35), rgba(0,0,0,0.75) 70%, #000 100%)" }} />
-
-            <div className="relative flex items-center justify-between px-5 shrink-0" style={{ height: 54 }}>
-              <button onClick={() => setVinylMode(false)} className="press p-1.5 rounded-full" style={{ background: "rgba(255,255,255,0.1)" }}><ChevronDown size={20} /></button>
-              <div className="flex items-center gap-1.5 text-[10px] tracking-wider" style={{ color: wakeLockActive ? accent : "#5A5A5C" }}>
-                <div className="w-1.5 h-1.5 rounded-full" style={{ background: wakeLockActive ? accent : "#5A5A5C" }} />
-                {wakeLockActive ? "SCREEN AWAKE" : "VINYL MODE"}
-              </div>
-              <button onClick={() => setCrackleOn((c) => !c)} className="press px-2.5 py-1.5 rounded-full text-[10px] font-semibold" style={{ background: crackleOn ? accent : "rgba(255,255,255,0.1)", color: crackleOn ? "#000" : "#FFFFFF" }}>
-                CRACKLE
-              </button>
-            </div>
-
-            <div className="relative flex-1 flex flex-col items-center justify-center gap-8 px-6"
-              onTouchStart={onVinylTouchStart} onTouchMove={onVinylTouchMove} onTouchEnd={onVinylTouchEnd}>
-              <div
-                className="relative"
-                style={{ width: "min(78vw, 320px)", aspectRatio: "1 / 1", transform: `translateX(${vinylSwipeX}px)`, transition: vinylSwipeX === 0 ? `transform 0.3s ${SPRING}` : "none" }}
-              >
-                {/* tonearm */}
-                <div style={{
-                  position: "absolute", top: "-8%", right: "-14%", width: "55%", height: "55%",
-                  transformOrigin: "82% 12%",
-                  transform: isPlaying ? "rotate(24deg)" : "rotate(-8deg)",
-                  transition: `transform 0.7s ${SPRING}`, zIndex: 5,
-                }}>
-                  <div style={{ position: "absolute", top: "10%", left: "48%", width: "6%", paddingBottom: "78%", background: "linear-gradient(180deg,#d8d8dc,#8a8a8e)", borderRadius: 6 }} />
-                  <div style={{ position: "absolute", top: "6%", left: "40%", width: "20%", height: "10%", background: "#c8c8cc", borderRadius: 4, boxShadow: "0 2px 6px rgba(0,0,0,0.4)" }} />
-                  <div style={{ position: "absolute", bottom: "10%", left: "34%", width: "20%", height: "14%", background: "#1c1c1e", borderRadius: 3, boxShadow: "0 2px 6px rgba(0,0,0,0.5)" }} />
-                </div>
-
-                {/* record */}
-                <button onClick={onVinylTap} aria-label="Toggle play"
-                  className="absolute inset-0 rounded-full"
-                  style={{
-                    background: "repeating-radial-gradient(circle at center, #1a1a1a 0px, #1a1a1a 2px, #0c0c0c 3px, #0c0c0c 5px)",
-                    boxShadow: `0 25px 70px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.06)`,
-                    animation: "vinylSpin 3.2s linear infinite",
-                    animationPlayState: isPlaying ? "running" : "paused",
-                  }}
-                >
-                  <div className="absolute rounded-full flex items-center justify-center overflow-hidden" style={{ inset: "30%", boxShadow: "0 0 0 2px rgba(0,0,0,0.4)" }}>
-                    {currentTrack.artUrl ? (
-                      <img src={currentTrack.artUrl} alt="" className="w-full h-full object-cover" />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center" style={{ background: artGradient(currentTrack.name) }}>
-                        <Disc3 size={30} color="rgba(255,255,255,0.5)" />
-                      </div>
-                    )}
-                  </div>
-                  <div className="absolute rounded-full" style={{ inset: "48.5%", background: "#050505", boxShadow: "inset 0 0 3px rgba(255,255,255,0.4)" }} />
-                </button>
-              </div>
-
-              <div className="text-center w-full max-w-xs">
-                <div className="text-lg font-bold truncate">{currentTrack.name}</div>
-                <div className="text-xs mt-1" style={{ color: "#98989D" }}>{queueSource} · {currentTrack.ext}</div>
-              </div>
-
-              <div className="flex items-center gap-2">
-                {ACCENTS.map((a, i) => (
-                  <button key={a.name} onClick={() => setAccentIdx(i)} className="press rounded-full" style={{ width: i === accentIdx ? 20 : 14, height: i === accentIdx ? 20 : 14, background: a.hex, boxShadow: i === accentIdx ? `0 0 0 2px #000, 0 0 0 3px ${a.hex}` : "none", transition: `all 0.2s ${SPRING}` }} aria-label={a.name} />
-                ))}
-              </div>
-
-              <div className="flex items-center gap-7">
-                <button onClick={() => stepTrack(-1)} className="press"><SkipBack size={26} fill="#FFFFFF" /></button>
-                <button onClick={togglePlay} className="press w-16 h-16 rounded-full flex items-center justify-center" style={{ background: accent }}>
-                  {isPlaying ? <Pause size={26} color="#000000" fill="#000000" /> : <Play size={26} color="#000000" fill="#000000" style={{ marginLeft: 3 }} />}
-                </button>
-                <button onClick={() => stepTrack(1)} className="press"><SkipForward size={26} fill="#FFFFFF" /></button>
-              </div>
-
-              <div className="w-full max-w-xs flex items-center gap-3">
-                <span className="text-xs w-9 text-right" style={{ color: "#98989D" }}>{fmtTime(currentTime)}</span>
-                <div className="flex-1 h-1 rounded-full" style={{ background: "rgba(255,255,255,0.15)" }}>
-                  <div className="h-1 rounded-full" style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%`, background: accent }} />
-                </div>
-                <span className="text-xs w-9" style={{ color: "#98989D" }}>{fmtTime(duration)}</span>
-              </div>
-              <div className="text-[10px] text-center" style={{ color: "#5A5A5C" }}>Tap the record to play/pause · swipe to skip</div>
-            </div>
-          </div>
-        );
-      })()}
-
       {contextTrackId && (
-        <BottomSheetBackdrop onClose={closeContext}>
+        <BottomSheetBackdrop bg={sheetBg} onClose={closeContext}>
           <SheetHandle />
           <div className="px-5 pb-1 text-sm font-semibold truncate">{library.find((t) => t.id === contextTrackId)?.name}</div>
           <SheetAction icon={<CornerDownRight size={17} />} label="Play Next" onClick={() => { playNext(contextTrackId); closeContext(); }} />
           <SheetAction icon={<ListPlus size={17} />} label="Play Later" onClick={() => { playLater(contextTrackId); closeContext(); }} />
+          <SheetAction icon={<Heart size={17} fill={likedIds.includes(contextTrackId) ? "#FA2D48" : "none"} />} label={likedIds.includes(contextTrackId) ? "Unlike" : "Like"} onClick={() => { toggleLike(contextTrackId); closeContext(); }} />
           <SheetAction icon={<Plus size={17} />} label="Add to Playlist…" onClick={() => { const id = contextTrackId; closeContext(); setAddSheetTrackId(id); }} />
           <SheetAction icon={<Info size={17} />} label="Song Info" onClick={() => { const id = contextTrackId; closeContext(); setInfoSheetTrackId(id); }} />
+          <SheetAction icon={<Tag size={17} />} label="Mood Tags…" onClick={() => { const id = contextTrackId; closeContext(); setTagSheetTrackId(id); }} />
           {contextInfo?.mode === "playlist" ? (
             <SheetAction icon={<Trash2 size={17} />} label="Remove from Playlist" danger onClick={() => { removeFromPlaylist(contextInfo.playlistId, contextTrackId); closeContext(); }} />
           ) : (
@@ -1271,14 +1445,24 @@ export default function MusicPlayer() {
       )}
 
       {addSheetTrackId && (
-        <BottomSheetBackdrop onClose={() => setAddSheetTrackId(null)}>
+        <BottomSheetBackdrop bg={sheetBg} onClose={() => setAddSheetTrackId(null)}>
           <SheetHandle />
           <div className="px-5 pb-2 text-sm font-semibold">Add to Playlist</div>
           <div className="max-h-64 overflow-y-auto">
-            {playlists.length === 0 ? (
-              <div className="px-5 py-4 text-xs" style={{ color: "#98989D" }}>No playlists yet. Create one from the Library tab.</div>
-            ) : (
+            {playlists.length === 0 ? (<div className="px-5 py-4 text-xs" style={{ color: "#98989D" }}>No playlists yet. Create one from the Library tab.</div>) : (
               playlists.map((p) => (<SheetAction key={p.id} icon={<ListMusic size={17} color="#FA2D48" />} label={p.name} sub={`${p.trackIds.length} songs`} onClick={() => addToPlaylist(p.id, addSheetTrackId)} />))
+            )}
+          </div>
+        </BottomSheetBackdrop>
+      )}
+
+      {bulkAddSheetOpen && (
+        <BottomSheetBackdrop bg={sheetBg} onClose={() => setBulkAddSheetOpen(false)}>
+          <SheetHandle />
+          <div className="px-5 pb-2 text-sm font-semibold">Add {selectedIds.length} songs to Playlist</div>
+          <div className="max-h-64 overflow-y-auto">
+            {playlists.length === 0 ? (<div className="px-5 py-4 text-xs" style={{ color: "#98989D" }}>No playlists yet. Create one from the Library tab.</div>) : (
+              playlists.map((p) => (<SheetAction key={p.id} icon={<ListMusic size={17} color="#FA2D48" />} label={p.name} sub={`${p.trackIds.length} songs`} onClick={() => bulkAddToPlaylist(p.id)} />))
             )}
           </div>
         </BottomSheetBackdrop>
@@ -1288,25 +1472,23 @@ export default function MusicPlayer() {
         const t = library.find((tt) => tt.id === infoSheetTrackId);
         if (!t) return null;
         return (
-          <BottomSheetBackdrop onClose={() => setInfoSheetTrackId(null)}>
+          <BottomSheetBackdrop bg={sheetBg} onClose={() => setInfoSheetTrackId(null)}>
             <SheetHandle />
-            <div className="flex items-center gap-3 px-5 pb-4">
-              <ArtBox track={t} className="w-14 h-14 rounded-lg shrink-0" />
-              <div className="min-w-0"><div className="text-sm font-semibold truncate">{t.name}</div><div className="text-xs" style={{ color: "#98989D" }}>{t.ext}</div></div>
-            </div>
+            <div className="flex items-center gap-3 px-5 pb-4"><ArtBox track={t} className="w-14 h-14 rounded-lg shrink-0" /><div className="min-w-0"><div className="text-sm font-semibold truncate">{t.name}</div><div className="text-xs" style={{ color: "#98989D" }}>{t.ext}</div></div></div>
             <div className="px-5 pb-6 flex flex-col gap-2 text-xs">
               <InfoRow label="Format" value={t.ext} />
               <InfoRow label="Duration" value={fmtTime(t.duration)} />
               <InfoRow label="Added" value={new Date(t.addedAt).toLocaleDateString()} />
               <InfoRow label="Play Count" value={String(playCounts[t.id] || 0)} />
               <InfoRow label="Album Art" value={t.artUrl ? "Embedded (found in file)" : "Not found — using generated cover"} />
+              <InfoRow label="Liked" value={likedIds.includes(t.id) ? "Yes" : "No"} />
             </div>
           </BottomSheetBackdrop>
         );
       })()}
 
       {newPlaylistSheet && (
-        <BottomSheetBackdrop onClose={() => setNewPlaylistSheet(false)}>
+        <BottomSheetBackdrop bg={sheetBg} onClose={() => setNewPlaylistSheet(false)}>
           <SheetHandle />
           <div className="px-5 pb-4">
             <div className="text-sm font-semibold mb-3">New Playlist</div>
@@ -1318,7 +1500,106 @@ export default function MusicPlayer() {
         </BottomSheetBackdrop>
       )}
 
-      <audio ref={audioRef} onTimeUpdate={onTimeUpdate} onLoadedMetadata={onLoadedMetadata} onEnded={onEnded} onError={onAudioError} />
+      {/* WOW — Settings sheet: theme, normalization, smart continue, storage, backup, folder import */}
+      {showSettings && (
+        <BottomSheetBackdrop bg={sheetBg} onClose={() => setShowSettings(false)}>
+          <SheetHandle />
+          <div className="px-5 pb-6" style={{ color: palette.text }}>
+            <div className="text-sm font-semibold mb-3">Settings</div>
+
+            <div className="text-xs mb-2" style={{ color: palette.subtext }}>THEME</div>
+            <div className="flex gap-2 mb-5">
+              {Object.keys(THEMES).map((k) => (
+                <button key={k} onClick={() => setTheme(k)} className="press flex-1 py-2 rounded-lg text-xs font-medium capitalize" style={{ background: THEMES[k].bg, color: THEMES[k].text, border: theme === k ? `2px solid ${THEMES[k].accent}` : "1px solid rgba(128,128,128,0.3)" }}>{k}</button>
+              ))}
+            </div>
+
+            <SettingRow label="Normalize Volume" sub="Even out loud/quiet tracks" value={normalizeVolume} onChange={() => setNormalizeVolume((v) => !v)} palette={palette} />
+            <SettingRow label="Smart Continue" sub="Keep playing similar songs when the queue ends" value={smartContinueEnabled} onChange={() => setSmartContinueEnabled((v) => !v)} palette={palette} />
+
+            <div className="text-xs mt-5 mb-2" style={{ color: palette.subtext }}>LIBRARY</div>
+            <button onClick={() => folderInputRef.current?.click()} className="press w-full flex items-center justify-between py-2.5 text-sm">
+              <span>Import Folder (auto-playlist)</span><ChevronDown size={15} style={{ transform: "rotate(-90deg)", color: palette.subtext }} />
+            </button>
+            <button onClick={exportPlaylists} className="press w-full flex items-center justify-between py-2.5 text-sm">
+              <span>Export Playlists</span><ChevronDown size={15} style={{ transform: "rotate(-90deg)", color: palette.subtext }} />
+            </button>
+            <button onClick={() => backupInputRef.current?.click()} className="press w-full flex items-center justify-between py-2.5 text-sm">
+              <span>Import Playlists Backup</span><ChevronDown size={15} style={{ transform: "rotate(-90deg)", color: palette.subtext }} />
+            </button>
+
+            <div className="text-xs mt-5 mb-2" style={{ color: palette.subtext }}>STORAGE</div>
+            {storageEstimate ? (
+              <div>
+                <div className="h-2 rounded-full overflow-hidden mb-1.5" style={{ background: palette.surface2 }}>
+                  <div className="h-full" style={{ width: `${Math.min(100, (storageEstimate.usage / (storageEstimate.quota || 1)) * 100)}%`, background: palette.accent }} />
+                </div>
+                <div className="text-xs" style={{ color: palette.subtext }}>{(storageEstimate.usage / 1048576).toFixed(0)} MB used of {(storageEstimate.quota / 1048576).toFixed(0)} MB available</div>
+              </div>
+            ) : (<div className="text-xs" style={{ color: palette.subtext }}>Storage info not available on this browser</div>)}
+          </div>
+        </BottomSheetBackdrop>
+      )}
+
+      {/* WOW — Listening Stats dashboard */}
+      {showStats && (
+        <BottomSheetBackdrop bg={sheetBg} onClose={() => setShowStats(false)}>
+          <SheetHandle />
+          <div className="px-5 pb-6" style={{ color: palette.text }}>
+            <div className="text-sm font-semibold mb-4">Listening Stats</div>
+            <div className="flex gap-3 mb-5">
+              <div className="flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
+                <div className="text-2xl font-extrabold">{weeklyPlays.length}</div>
+                <div className="text-xs" style={{ color: palette.subtext }}>plays this week</div>
+              </div>
+              <div className="flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
+                <div className="text-2xl font-extrabold">{weeklyMinutes}</div>
+                <div className="text-xs" style={{ color: palette.subtext }}>minutes this week</div>
+              </div>
+              <div className="flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
+                <div className="text-2xl font-extrabold">{totalLifetimePlays}</div>
+                <div className="text-xs" style={{ color: palette.subtext }}>lifetime plays</div>
+              </div>
+            </div>
+            <div className="text-xs mb-2" style={{ color: palette.subtext }}>TOP THIS WEEK</div>
+            {weeklyTop.length === 0 ? (
+              <div className="text-xs" style={{ color: palette.subtext }}>Play something to start building your stats.</div>
+            ) : weeklyTop.map(({ track, count }) => (
+              <div key={track.id} className="flex items-center gap-3 py-2">
+                <ArtBox track={track} className="w-10 h-10 rounded-md shrink-0" />
+                <div className="flex-1 min-w-0 text-sm truncate">{track.name}</div>
+                <div className="text-xs" style={{ color: palette.subtext }}>{count}×</div>
+              </div>
+            ))}
+          </div>
+        </BottomSheetBackdrop>
+      )}
+
+      {/* WOW — mood tag picker */}
+      {tagSheetTrackId && (
+        <BottomSheetBackdrop bg={sheetBg} onClose={() => setTagSheetTrackId(null)}>
+          <SheetHandle />
+          <div className="px-5 pb-2 text-sm font-semibold">Mood Tags</div>
+          <div className="px-5 pb-6 flex flex-wrap gap-2">
+            {MOOD_TAGS.map((tag) => {
+              const active = (tagsMap[tagSheetTrackId] || []).includes(tag);
+              return (
+                <button key={tag} onClick={() => toggleTag(tagSheetTrackId, tag)} className="press px-3 py-1.5 rounded-full text-xs font-medium" style={{ background: active ? "#FA2D48" : "rgba(255,255,255,0.1)", color: active ? "#fff" : palette.subtext }}>{tag}</button>
+              );
+            })}
+          </div>
+        </BottomSheetBackdrop>
+      )}
+
+      {/* WOW — milestone confetti */}
+      {confettiMilestone && <Confetti />}
+
+      {/* hidden canvas/video used to power the floating Picture-in-Picture mini player */}
+      <canvas ref={pipCanvasRef} className="hidden" />
+      <video ref={pipVideoRef} muted playsInline className="hidden" />
+
+      <audio ref={audioARef} onTimeUpdate={onTimeUpdateFor("A")} onLoadedMetadata={onLoadedMetadataFor("A")} onEnded={onEndedFor("A")} onError={onAudioErrorFor("A")} />
+      <audio ref={audioBRef} onTimeUpdate={onTimeUpdateFor("B")} onLoadedMetadata={onLoadedMetadataFor("B")} onEnded={onEndedFor("B")} onError={onAudioErrorFor("B")} />
     </div>
   );
 }
@@ -1332,23 +1613,43 @@ function ArtBox({ track, className, children }) {
     </div>
   );
 }
-
 function EmptyState({ dragOver, message }) {
-  return (
-    <div className="flex flex-col items-center justify-center gap-3 py-20 px-6 text-center">
-      <Upload size={26} color={dragOver ? "#FA2D48" : "#5A5A5C"} />
-      <p className="text-sm max-w-xs" style={{ color: "#98989D" }}>{message}</p>
-    </div>
-  );
+  return (<div className="flex flex-col items-center justify-center gap-3 py-20 px-6 text-center"><Upload size={26} color={dragOver ? "#FA2D48" : "#5A5A5C"} /><p className="text-sm max-w-xs" style={{ color: "#98989D" }}>{message}</p></div>);
 }
-
 function HomeRow({ title, icon, tracks, onPlay }) {
+  const wrapRef = useRef(null);
+  const itemRefs = useRef([]);
+  const rafRef = useRef(null);
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const update = () => {
+      const rect = el.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      itemRefs.current.forEach((item) => {
+        if (!item) return;
+        const r = item.getBoundingClientRect();
+        const dist = Math.abs(r.left + r.width / 2 - centerX);
+        const t = Math.max(0, 1 - dist / (rect.width * 0.9));
+        const scale = 0.9 + t * 0.1;
+        item.style.transform = `scale(${scale})`;
+        item.style.opacity = String(0.75 + t * 0.25);
+      });
+      rafRef.current = null;
+    };
+    const onScroll = () => { if (!rafRef.current) rafRef.current = requestAnimationFrame(update); };
+    update();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [tracks.length]);
+
   return (
     <div>
       <div className="flex items-center gap-1.5 text-lg font-bold mb-3">{icon}{title}</div>
-      <div className="hscroll pb-2">
+      <div ref={wrapRef} className="hscroll pb-2">
         {tracks.map((t, i) => (
-          <button key={t.id} onClick={() => onPlay(i)} className="press shrink-0 w-32 text-left">
+          <button key={t.id} ref={(el) => (itemRefs.current[i] = el)} onClick={() => onPlay(i)} className="press shrink-0 w-32 text-left" style={{ transition: `transform 0.15s ${SPRING}, opacity 0.15s` }}>
             <ArtBox track={t} className="w-32 h-32 rounded-xl mb-2" />
             <div className="text-sm font-medium truncate">{t.name}</div>
             <div className="text-xs" style={{ color: "#98989D" }}>{t.ext}</div>
@@ -1359,7 +1660,8 @@ function HomeRow({ title, icon, tracks, onPlay }) {
   );
 }
 
-function TrackRow({ t, isCurrent, isPlaying, onTap, onMenu, onSwipeDelete }) {
+function TrackRow({ t, isCurrent, isPlaying, onTap, onMenu, onSwipeDelete, liked, selectMode, selected, onToggleSelect, palette }) {
+  const p = palette || THEMES.amoled;
   const [swipeX, setSwipeX] = useState(0);
   const startX = useRef(0);
   const startY = useRef(0);
@@ -1368,68 +1670,92 @@ function TrackRow({ t, isCurrent, isPlaying, onTap, onMenu, onSwipeDelete }) {
   const suppressTap = useRef(false);
 
   const onTouchStart = (e) => {
+    if (selectMode) return;
     startX.current = e.touches[0].clientX; startY.current = e.touches[0].clientY;
     dragging.current = false; suppressTap.current = false;
     if (onMenu) longPressTimer.current = setTimeout(() => { suppressTap.current = true; onMenu(); }, 480);
   };
   const onTouchMove = (e) => {
+    if (selectMode) return;
     const dx = e.touches[0].clientX - startX.current, dy = e.touches[0].clientY - startY.current;
     if (Math.abs(dx) > 8 || Math.abs(dy) > 8) clearTimeout(longPressTimer.current);
     if (onSwipeDelete && Math.abs(dx) > Math.abs(dy)) { dragging.current = true; setSwipeX(Math.max(-84, Math.min(0, dx))); }
   };
   const onTouchEnd = () => {
+    if (selectMode) return;
     clearTimeout(longPressTimer.current);
     if (dragging.current) { setSwipeX((x) => (x < -50 ? -84 : 0)); dragging.current = false; return; }
     if (!suppressTap.current) onTap();
   };
-  const onContextMenu = (e) => { e.preventDefault(); onMenu && onMenu(); };
+  const onContextMenu = (e) => { if (selectMode) return; e.preventDefault(); onMenu && onMenu(); };
+  const handleClick = () => { if (selectMode) { onToggleSelect(); return; } if (swipeX === 0) onTap(); };
 
   return (
     <div className="relative overflow-hidden" style={{ borderRadius: 12 }}>
-      {onSwipeDelete && (
+      {onSwipeDelete && !selectMode && (
         <div className="absolute right-0 top-0 bottom-0 flex items-center justify-center" style={{ width: 84, background: "#FF453A" }}>
           <button onClick={() => { onSwipeDelete(); setSwipeX(0); }} className="press p-3"><Trash2 size={18} color="#fff" /></button>
         </div>
       )}
-      <div onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd} onContextMenu={onContextMenu} onClick={() => { if (swipeX === 0) onTap(); }}
-        className="flex items-center gap-3 py-2.5" style={{ transform: `translateX(${swipeX}px)`, transition: dragging.current ? "none" : `transform 0.2s ${SPRING}`, background: "#000000" }}>
+      <div onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd} onContextMenu={onContextMenu} onClick={handleClick}
+        className="flex items-center gap-3 py-2.5" style={{ transform: `translateX(${swipeX}px)`, transition: dragging.current ? "none" : `transform 0.2s ${SPRING}`, background: p.bg }}>
+        {selectMode && (selected ? <CheckCircle2 size={20} color={p.accent} className="shrink-0" /> : <Circle size={20} color={p.subtext} className="shrink-0" />)}
         <ArtBox track={t} className="w-11 h-11 rounded-lg shrink-0 flex items-center justify-center">
-          {isCurrent && isPlaying ? (
-            <div className="flex items-end gap-0.5 h-3.5"><div className="eq-bar" style={{ animationDelay: "0s", background: "#fff" }} /><div className="eq-bar" style={{ animationDelay: "0.2s", background: "#fff" }} /><div className="eq-bar" style={{ animationDelay: "0.4s", background: "#fff" }} /></div>
-          ) : (<Music size={15} color="rgba(255,255,255,0.6)" />)}
+          {isCurrent && isPlaying ? (<div className="flex items-end gap-0.5 h-3.5"><div className="eq-bar" style={{ animationDelay: "0s", background: "#fff" }} /><div className="eq-bar" style={{ animationDelay: "0.2s", background: "#fff" }} /><div className="eq-bar" style={{ animationDelay: "0.4s", background: "#fff" }} /></div>) : (<Music size={15} color="rgba(255,255,255,0.6)" />)}
         </ArtBox>
         <div className="flex-1 min-w-0">
-          <div className="text-sm truncate" style={{ color: isCurrent ? "#FA2D48" : "#FFFFFF" }}>{t.name}</div>
-          <div className="text-xs" style={{ color: "#98989D" }}>{t.ext}{t.duration ? ` · ${fmtTime(t.duration)}` : ""}</div>
+          <div className="text-sm truncate flex items-center gap-1.5" style={{ color: isCurrent ? p.accent : p.text }}>
+            {t.name}
+            {liked && <Heart size={11} fill={p.accent} color={p.accent} className="shrink-0" />}
+          </div>
+          <div className="text-xs" style={{ color: p.subtext }}>{t.ext}{t.duration ? ` · ${fmtTime(t.duration)}` : ""}</div>
         </div>
-        {onMenu && <button onClick={(e) => { e.stopPropagation(); onMenu(); }} className="press p-2 shrink-0" style={{ color: "#98989D" }}><MoreHorizontal size={18} /></button>}
+        {onMenu && !selectMode && <button onClick={(e) => { e.stopPropagation(); onMenu(); }} className="press p-2 shrink-0" style={{ color: p.subtext }}><MoreHorizontal size={18} /></button>}
       </div>
     </div>
   );
 }
 
-function BottomSheetBackdrop({ onClose, children }) {
-  return (
-    <>
-      <div className="absolute inset-0 fade-in" style={{ background: "rgba(0,0,0,0.55)", zIndex: 80 }} onClick={onClose} />
-      <div className="sheet-enter absolute left-0 right-0 bottom-0 rounded-t-2xl pb-8 pt-2" style={{ background: "#1C1C1E", zIndex: 81, maxHeight: "70vh", overflowY: "auto" }}>{children}</div>
-    </>
-  );
+function BottomSheetBackdrop({ onClose, children, bg }) {
+  return (<><div className="absolute inset-0 fade-in" style={{ background: "rgba(0,0,0,0.55)", zIndex: 80 }} onClick={onClose} /><div className="sheet-enter absolute left-0 right-0 bottom-0 rounded-t-2xl pb-8 pt-2" style={{ background: bg || "#1C1C1E", zIndex: 81, maxHeight: "70vh", overflowY: "auto" }}>{children}</div></>);
 }
 function SheetHandle() { return <div className="w-9 h-1 rounded-full mx-auto mb-3" style={{ background: "rgba(255,255,255,0.25)" }} />; }
 function SheetAction({ icon, label, sub, onClick, danger }) {
-  return (
-    <button onClick={onClick} className="press w-full flex items-center gap-3 px-5 py-3 text-left">
-      <span style={{ color: danger ? "#FF453A" : "#FA2D48" }}>{icon}</span>
-      <span className="text-sm flex-1" style={{ color: danger ? "#FF453A" : "#FFFFFF" }}>{label}</span>
-      {sub && <span className="text-xs" style={{ color: "#98989D" }}>{sub}</span>}
-    </button>
-  );
+  return (<button onClick={onClick} className="press w-full flex items-center gap-3 px-5 py-3 text-left"><span style={{ color: danger ? "#FF453A" : "#FA2D48" }}>{icon}</span><span className="text-sm flex-1" style={{ color: danger ? "#FF453A" : "#FFFFFF" }}>{label}</span>{sub && <span className="text-xs" style={{ color: "#98989D" }}>{sub}</span>}</button>);
 }
 function InfoRow({ label, value }) {
   return (<div className="flex items-center justify-between py-1.5" style={{ borderBottom: "1px solid rgba(255,255,255,0.08)" }}><span style={{ color: "#98989D" }}>{label}</span><span>{value}</span></div>);
 }
-
+function SettingRow({ label, sub, value, onChange, palette }) {
+  return (
+    <button onClick={onChange} className="press w-full flex items-center justify-between py-2.5 text-left">
+      <div><div className="text-sm">{label}</div>{sub && <div className="text-xs" style={{ color: palette.subtext }}>{sub}</div>}</div>
+      <div className="w-11 h-6 rounded-full relative shrink-0" style={{ background: value ? "#FA2D48" : "rgba(128,128,128,0.35)", transition: "background 0.15s" }}>
+        <div className="absolute top-0.5 w-5 h-5 rounded-full bg-white" style={{ left: value ? 22 : 2, transition: "left 0.15s" }} />
+      </div>
+    </button>
+  );
+}
+function Confetti() {
+  const pieces = Array.from({ length: 40 }, (_, i) => i);
+  const colors = ["#FA2D48", "#FFD60A", "#30D158", "#64D2FF", "#BF5AF2"];
+  return (
+    <div className="absolute inset-0 pointer-events-none overflow-hidden" style={{ zIndex: 90 }}>
+      <style>{`
+        @keyframes confettiFall { 0% { transform: translateY(-10vh) rotate(0deg); opacity: 1; } 100% { transform: translateY(110vh) rotate(540deg); opacity: 0; } }
+      `}</style>
+      {pieces.map((i) => (
+        <div key={i} style={{
+          position: "absolute", left: `${Math.random() * 100}%`, top: "-5%",
+          width: 8, height: 8, background: colors[i % colors.length],
+          borderRadius: i % 2 ? "50%" : "2px",
+          animation: `confettiFall ${1.6 + Math.random() * 1.2}s ease-in forwards`,
+          animationDelay: `${Math.random() * 0.4}s`,
+        }} />
+      ))}
+    </div>
+  );
+}
 function LyricsPanel({ track, text, onSave, onBack }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
@@ -1438,14 +1764,9 @@ function LyricsPanel({ track, text, onSave, onBack }) {
     <div className="flex-1 flex flex-col px-5 overflow-hidden">
       <div className="flex items-center justify-between py-2">
         <button onClick={onBack} className="press flex items-center gap-1 text-sm font-medium"><ChevronDown size={17} /> Back</button>
-        {!editing ? (<button onClick={() => setEditing(true)} className="press text-sm font-medium" style={{ color: "#FA2D48" }}>{text ? "Edit" : "Add Lyrics"}</button>)
-          : (<button onClick={() => { onSave(draft); setEditing(false); }} className="press text-sm font-medium" style={{ color: "#FA2D48" }}>Save</button>)}
+        {!editing ? (<button onClick={() => setEditing(true)} className="press text-sm font-medium" style={{ color: "#FA2D48" }}>{text ? "Edit" : "Add Lyrics"}</button>) : (<button onClick={() => { onSave(draft); setEditing(false); }} className="press text-sm font-medium" style={{ color: "#FA2D48" }}>Save</button>)}
       </div>
-      {editing ? (
-        <textarea autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Paste or type lyrics here…" className="flex-1 bg-transparent outline-none text-sm leading-relaxed resize-none" style={{ color: "#FFFFFF" }} />
-      ) : (
-        <div className="flex-1 overflow-y-auto text-base leading-loose whitespace-pre-wrap" style={{ color: text ? "#FFFFFF" : "#98989D" }}>{text || "No lyrics added yet. Tap \"Add Lyrics\" to write or paste them in."}</div>
-      )}
+      {editing ? (<textarea autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Paste or type lyrics here…" className="flex-1 bg-transparent outline-none text-sm leading-relaxed resize-none" style={{ color: "#FFFFFF" }} />) : (<div className="flex-1 overflow-y-auto text-base leading-loose whitespace-pre-wrap" style={{ color: text ? "#FFFFFF" : "#98989D" }}>{text || "No lyrics added yet. Tap \"Add Lyrics\" to write or paste them in."}</div>)}
     </div>
   );
 }
