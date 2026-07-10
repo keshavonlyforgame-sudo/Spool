@@ -1187,11 +1187,11 @@ export default function MusicPlayer() {
         input[type="range"]::-moz-range-thumb { width:16px; height:16px; border-radius:50%; background:#FFFFFF; cursor:pointer; border:none; }
         input[type="range"].vert { writing-mode: vertical-lr; direction: rtl; width:4px; height:90px; }
         ::-webkit-scrollbar { display: none; }
-        .press:active { transform: scale(0.94); }
-        .press { transition: transform 0.12s ${SPRING}; }
+        .press:active { transform: scale(0.93) translateY(0.5px); filter: brightness(0.94); }
+        .press { transition: transform 0.15s ${SPRING}, filter 0.15s; }
         .sheet-enter { animation: slideUp 0.28s ${SPRING}; }
         @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
-        .eq-bar { width: 3px; background: #FA2D48; border-radius: 2px; animation: eqPulse 0.9s ease-in-out infinite; }
+        .eq-bar { width: 3px; background: #FA2D48; border-radius: 2px; animation: eqPulse 0.9s ease-in-out infinite; box-shadow: 0 0 4px rgba(250,45,72,0.7); }
         @keyframes eqPulse { 0%,100% { height: 4px; } 50% { height: 14px; } }
         .hscroll { display: flex; overflow-x: auto; gap: 12px; scroll-snap-type: x proximity; }
         .hscroll > * { scroll-snap-align: start; }
@@ -1202,21 +1202,65 @@ export default function MusicPlayer() {
           .np-player-body .np-art { width: 38vh; max-width: 38vh; height: 38vh; flex-shrink: 0; }
           .np-player-body .np-controls-col { width: auto; max-width: 360px; }
         }
+
+        /* ---- Liquid Glass system ---- */
+        .glass {
+          background: rgba(255,255,255,0.07);
+          backdrop-filter: blur(28px) saturate(190%);
+          -webkit-backdrop-filter: blur(28px) saturate(190%);
+          border: 1px solid rgba(255,255,255,0.14);
+          box-shadow: 0 10px 34px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.18), inset 0 -10px 20px -12px rgba(0,0,0,0.25);
+          position: relative;
+        }
+        .glass-light {
+          background: rgba(0,0,0,0.05) !important;
+          border: 1px solid rgba(0,0,0,0.08) !important;
+          box-shadow: 0 10px 30px rgba(0,0,0,0.1), inset 0 1px 0 rgba(255,255,255,0.6) !important;
+        }
+        .glass::before {
+          content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+          background: linear-gradient(120deg, rgba(255,255,255,0.16) 0%, rgba(255,255,255,0.02) 32%, transparent 55%);
+        }
+        .glass-tile {
+          position: relative; overflow: hidden;
+          box-shadow: 0 6px 16px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.25), inset 0 -6px 12px -8px rgba(0,0,0,0.5);
+          transform: translateZ(0);
+        }
+        .glass-tile::after {
+          content: ""; position: absolute; inset: 0; pointer-events: none;
+          background: linear-gradient(135deg, rgba(255,255,255,0.35) 0%, rgba(255,255,255,0) 26%, rgba(0,0,0,0.12) 100%);
+        }
+        .glass-pill {
+          background: rgba(255,255,255,0.09);
+          backdrop-filter: blur(16px) saturate(180%);
+          -webkit-backdrop-filter: blur(16px) saturate(180%);
+          border: 1px solid rgba(255,255,255,0.14);
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.2), 0 4px 10px rgba(0,0,0,0.25);
+        }
+        .press-3d { transform-style: preserve-3d; transition: transform 0.16s cubic-bezier(0.32,0.72,0,1), box-shadow 0.16s; }
+        .press-3d:active { transform: scale(0.93) translateY(1px); box-shadow: 0 2px 6px rgba(0,0,0,0.3); }
+        .shine-sweep { position: relative; overflow: hidden; }
+        .shine-sweep::after {
+          content: ""; position: absolute; top: -60%; left: -60%; width: 40%; height: 220%;
+          background: linear-gradient(120deg, transparent, rgba(255,255,255,0.35), transparent);
+          transform: rotate(20deg); animation: shineMove 4.5s ease-in-out infinite;
+        }
+        @keyframes shineMove { 0% { left: -60%; } 45% { left: 130%; } 100% { left: 130%; } }
       `}</style>
 
       {toast && <div className="fade-in absolute top-3 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs font-medium" style={{ background: "rgba(40,40,42,0.95)", zIndex: 70, backdropFilter: "blur(20px)" }}>{toast}</div>}
 
-      <header className="flex items-center justify-between px-4 shrink-0" style={{ height: 54, background: palette.bg, color: palette.text }}>
+      <header className={`glass flex items-center justify-between px-4 shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 54, color: palette.text }}>
         <h1 className="text-2xl font-extrabold tracking-tight">{activeTab === "home" ? "Home" : activeTab === "library" ? (openPlaylistId ? "" : "Library") : "Search"}</h1>
         {!openPlaylistId && (
           <div className="flex items-center gap-2">
             {activeTab === "home" && (
               <>
                 <button onClick={() => setShowStats(true)} className="press p-2 rounded-full" style={{ background: palette.surface }}><TrendingUp size={16} /></button>
-                <button onClick={() => { setShowSettings(true); refreshStorageEstimate(); }} className="press p-2 rounded-full" style={{ background: palette.surface }}><Settings size={16} /></button>
+                <button onClick={() => { setShowSettings(true); refreshStorageEstimate(); }} className="glass-pill press press-3d p-2 rounded-full" style={{ background: palette.surface }}><Settings size={16} /></button>
               </>
             )}
-            <button onClick={() => fileInputRef.current?.click()} className="press p-2 rounded-full" style={{ background: palette.surface }}><Upload size={17} /></button>
+            <button onClick={() => fileInputRef.current?.click()} className="glass-pill press press-3d p-2 rounded-full" style={{ background: palette.surface }}><Upload size={17} /></button>
           </div>
         )}
         {openPlaylistId && (
@@ -1247,7 +1291,7 @@ export default function MusicPlayer() {
                     <div className="hscroll pb-2">
                       {playlists.map((p) => (
                         <button key={p.id} onClick={() => { setActiveTab("library"); setOpenPlaylistId(p.id); }} className="press shrink-0 w-32 text-left">
-                          <div className="w-32 h-32 rounded-xl flex items-center justify-center mb-2" style={{ background: palette.surface }}><ListMusic size={26} color={palette.accent} /></div>
+                          <div className="w-32 h-32 rounded-xl flex items-center justify-center mb-2 glass-tile" style={{ background: palette.surface }}><ListMusic size={26} color={palette.accent} /></div>
                           <div className="text-sm font-medium truncate">{p.name}</div>
                           <div className="text-xs" style={{ color: "#98989D" }}>{p.trackIds.length} songs</div>
                         </button>
@@ -1267,9 +1311,9 @@ export default function MusicPlayer() {
               <button onClick={() => { setSelectMode((s) => !s); setSelectedIds([]); }} className="press px-3 py-1.5 rounded-full text-xs font-medium" style={{ background: selectMode ? palette.accent : palette.surface2, color: selectMode ? "#fff" : palette.subtext }}>{selectMode ? "Done" : "Select"}</button>
               <div className="flex-1" />
               {!selectMode && (<>
-                <button onClick={() => setLibraryView((v) => (v === "list" ? "grid" : "list"))} className="press p-2 rounded-full" style={{ background: palette.surface2, color: palette.text }}>{libraryView === "list" ? <LayoutGrid size={15} /> : <ListIcon size={15} />}</button>
+                <button onClick={() => setLibraryView((v) => (v === "list" ? "grid" : "list"))} className="glass-pill press press-3d p-2 rounded-full" style={{ background: palette.surface2, color: palette.text }}>{libraryView === "list" ? <LayoutGrid size={15} /> : <ListIcon size={15} />}</button>
                 <div className="relative">
-                  <button onClick={() => setShowSortMenu((s) => !s)} className="press p-2 rounded-full" style={{ background: palette.surface2, color: palette.text }}><ArrowUpDown size={15} /></button>
+                  <button onClick={() => setShowSortMenu((s) => !s)} className="glass-pill press press-3d p-2 rounded-full" style={{ background: palette.surface2, color: palette.text }}><ArrowUpDown size={15} /></button>
                   {showSortMenu && (
                     <div className="absolute right-0 top-10 rounded-xl py-1 w-40 fade-in" style={{ background: palette.surface2, zIndex: 30 }}>
                       {[["recent", "Recently Added"], ["name", "Name"], ["duration", "Duration"]].map(([k, l]) => (<button key={k} onClick={() => { setLibrarySort(k); setShowSortMenu(false); }} className="block w-full text-left px-4 py-2 text-xs" style={{ color: librarySort === k ? palette.accent : palette.text }}>{l}</button>))}
@@ -1292,7 +1336,7 @@ export default function MusicPlayer() {
               <div className="hscroll pb-3">
                 {playlists.map((p) => (
                   <button key={p.id} onClick={() => setOpenPlaylistId(p.id)} className="press shrink-0 w-28 text-left">
-                    <div className="w-28 h-28 rounded-xl flex items-center justify-center mb-1.5" style={{ background: palette.surface }}><ListMusic size={22} color={palette.accent} /></div>
+                    <div className="w-28 h-28 rounded-xl flex items-center justify-center mb-1.5 glass-tile" style={{ background: palette.surface }}><ListMusic size={22} color={palette.accent} /></div>
                     <div className="text-xs font-medium truncate">{p.name}</div>
                   </button>
                 ))}
@@ -1326,7 +1370,7 @@ export default function MusicPlayer() {
         {activeTab === "library" && openPlaylistId && (
           <div className="pt-1">
             <div className="flex items-center gap-3 mb-4">
-              <div className="w-20 h-20 rounded-xl flex items-center justify-center shrink-0" style={{ background: palette.surface }}><ListMusic size={30} color={palette.accent} /></div>
+              <div className="w-20 h-20 rounded-xl flex items-center justify-center shrink-0 glass-tile" style={{ background: palette.surface }}><ListMusic size={30} color={palette.accent} /></div>
               <div><div className="text-xl font-extrabold">{activePlaylist?.name}</div><div className="text-xs" style={{ color: "#98989D" }}>{playlistTracks.length} songs</div></div>
               <button onClick={() => deletePlaylist(openPlaylistId)} className="press ml-auto p-2" style={{ color: "#7A3A22" }}><Trash2 size={17} /></button>
             </div>
@@ -1370,7 +1414,7 @@ export default function MusicPlayer() {
       </main>
 
       {currentTrack && !nowPlayingOpen && !selectMode && (
-        <div onClick={() => setNowPlayingOpen(true)} className="press absolute left-2 right-2 flex items-center gap-3 px-3 rounded-2xl fade-in" style={{ bottom: 66, height: 60, background: glassPanel, backdropFilter: "blur(24px)", zIndex: 20 }}>
+        <div onClick={() => setNowPlayingOpen(true)} className={`glass press press-3d absolute left-2 right-2 flex items-center gap-3 px-3 rounded-2xl fade-in ${theme === "light" ? "glass-light" : ""}`} style={{ bottom: 66, height: 60, zIndex: 20, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)" }}>
           <ArtBox track={currentTrack} className="w-9 h-9 rounded-lg shrink-0" />
           <div className="flex-1 min-w-0 text-left"><div className="text-sm font-medium truncate">{currentTrack.name}</div></div>
           {isPlaying && <div className="flex items-end gap-0.5 h-4 shrink-0"><div className="eq-bar" style={{ animationDelay: "0s" }} /><div className="eq-bar" style={{ animationDelay: "0.2s" }} /><div className="eq-bar" style={{ animationDelay: "0.4s" }} /></div>}
@@ -1380,7 +1424,7 @@ export default function MusicPlayer() {
       )}
 
       {selectMode && (
-        <div className="absolute left-2 right-2 flex items-center gap-2 px-3 rounded-2xl fade-in" style={{ bottom: 66, height: 60, background: glassPanel, backdropFilter: "blur(24px)", zIndex: 20 }}>
+        <div className={`glass absolute left-2 right-2 flex items-center gap-2 px-3 rounded-2xl fade-in ${theme === "light" ? "glass-light" : ""}`} style={{ bottom: 66, height: 60, zIndex: 20, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)" }}>
           <button onClick={clearSelection} className="press p-2"><X size={20} /></button>
           <span className="text-sm font-medium flex-1">{selectedIds.length} selected</span>
           <button onClick={bulkPlay} disabled={!selectedIds.length} className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><Play size={20} fill="#fff" /></button>
@@ -1389,7 +1433,7 @@ export default function MusicPlayer() {
         </div>
       )}
 
-      <nav className="absolute left-0 right-0 bottom-0 flex items-stretch" style={{ height: 66, background: glassBar, backdropFilter: "blur(24px)", borderTop: `1px solid ${theme === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.08)"}`, zIndex: 21 }}>
+      <nav className={`glass absolute left-0 right-0 bottom-0 flex items-stretch ${theme === "light" ? "glass-light" : ""}`} style={{ height: 66, zIndex: 21, border: "none", borderTop: `1px solid ${theme === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.1)"}`, boxShadow: "0 -8px 24px rgba(0,0,0,0.3)" }}>
         {[["home", "Home", <Home size={22} />], ["library", "Library", <LibraryIcon size={22} />], ["search", "Search", <Search size={22} />]].map(([key, label, icon]) => (
           <button key={key} onClick={() => { setActiveTab(key); if (key !== "library") setOpenPlaylistId(null); clearSelection(); }} className="press flex-1 flex flex-col items-center justify-center gap-1" style={{ color: activeTab === key ? "#FA2D48" : "#98989D" }}>{icon}<span className="text-[10px] font-medium">{label}</span></button>
         ))}
@@ -1509,7 +1553,10 @@ export default function MusicPlayer() {
                 <div className="flex items-center gap-6">
                   <button onClick={() => setShuffle((s) => !s)} className="press" style={{ color: shuffle ? accent : "#98989D" }}><Shuffle size={19} /></button>
                   <button onClick={() => stepTrack(-1)} className="press"><SkipBack size={28} fill="#FFFFFF" /></button>
-                  <button onClick={togglePlay} className="press w-16 h-16 rounded-full flex items-center justify-center" style={{ background: "#FFFFFF" }}>{isPlaying ? <Pause size={26} color="#000000" fill="#000000" /> : <Play size={26} color="#000000" fill="#000000" style={{ marginLeft: 3 }} />}</button>
+                  <div className="relative">
+                    <div className="absolute rounded-full" style={{ inset: -10, background: accent, filter: "blur(18px)", opacity: isPlaying ? 0.55 : 0.25, transition: "opacity 0.4s" }} />
+                    <button onClick={togglePlay} className="press press-3d shine-sweep relative w-16 h-16 rounded-full flex items-center justify-center" style={{ background: "linear-gradient(155deg, #FFFFFF, #E4E4E6)", boxShadow: "0 8px 20px rgba(0,0,0,0.4), inset 0 1px 1px rgba(255,255,255,0.9), inset 0 -3px 6px rgba(0,0,0,0.12)" }}>{isPlaying ? <Pause size={26} color="#000000" fill="#000000" /> : <Play size={26} color="#000000" fill="#000000" style={{ marginLeft: 3 }} />}</button>
+                  </div>
                   <button onClick={() => stepTrack(1)} className="press"><SkipForward size={28} fill="#FFFFFF" /></button>
                   <button onClick={cycleRepeat} className="press" style={{ color: repeatMode !== "off" ? accent : "#98989D" }}>{repeatMode === "one" ? <Repeat1 size={19} /> : <Repeat size={19} />}</button>
                 </div>
@@ -1766,7 +1813,7 @@ export default function MusicPlayer() {
 // =====================================================================
 function ArtBox({ track, className, children }) {
   return (
-    <div className={className} style={{ background: artGradient(track.name), position: "relative", overflow: "hidden" }}>
+    <div className={`${className} glass-tile`} style={{ background: artGradient(track.name), position: "relative", overflow: "hidden" }}>
       {track.artUrl && <img src={track.artUrl} alt="" className="absolute inset-0 w-full h-full object-cover" />}
       {!track.artUrl && children}
     </div>
@@ -1808,8 +1855,9 @@ function HomeRow({ title, icon, tracks, onPlay }) {
       <div className="flex items-center gap-1.5 text-lg font-bold mb-3">{icon}{title}</div>
       <div ref={wrapRef} className="hscroll pb-2">
         {tracks.map((t, i) => (
-          <button key={t.id} ref={(el) => (itemRefs.current[i] = el)} onClick={() => onPlay(i)} className="press shrink-0 w-32 text-left" style={{ transition: `transform 0.15s ${SPRING}, opacity 0.15s` }}>
-            <ArtBox track={t} className="w-32 h-32 rounded-xl mb-2" />
+          <button key={t.id} ref={(el) => (itemRefs.current[i] = el)} onClick={() => onPlay(i)} className="press shrink-0 w-32 text-left relative" style={{ transition: `transform 0.15s ${SPRING}, opacity 0.15s` }}>
+            <div className="absolute rounded-full" style={{ inset: "8%", background: `hsl(${artHue(t.name)} 70% 45%)`, filter: "blur(22px)", opacity: 0.45, zIndex: 0 }} />
+            <ArtBox track={t} className="relative w-32 h-32 rounded-2xl mb-2" />
             <div className="text-sm font-medium truncate">{t.name}</div>
             <div className="text-xs" style={{ color: "#98989D" }}>{t.ext}</div>
           </button>
@@ -1876,7 +1924,7 @@ function TrackRow({ t, isCurrent, isPlaying, onTap, onMenu, onSwipeDelete, liked
 }
 
 function BottomSheetBackdrop({ onClose, children, bg }) {
-  return (<><div className="absolute inset-0 fade-in" style={{ background: "rgba(0,0,0,0.55)", zIndex: 80 }} onClick={onClose} /><div className="sheet-enter absolute left-0 right-0 bottom-0 rounded-t-2xl pb-8 pt-2" style={{ background: bg || "#1C1C1E", zIndex: 81, maxHeight: "70vh", overflowY: "auto" }}>{children}</div></>);
+  return (<><div className="absolute inset-0 fade-in" style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)", zIndex: 80 }} onClick={onClose} /><div className="glass sheet-enter absolute left-0 right-0 bottom-0 rounded-t-3xl pb-8 pt-2" style={{ background: bg || "#1C1C1E", zIndex: 81, maxHeight: "70vh", overflowY: "auto", border: "none", borderTop: "1px solid rgba(255,255,255,0.16)", boxShadow: "0 -16px 40px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.12)" }}>{children}</div></>);
 }
 function SheetHandle() { return <div className="w-9 h-1 rounded-full mx-auto mb-3" style={{ background: "rgba(255,255,255,0.25)" }} />; }
 function SheetAction({ icon, label, sub, onClick, danger }) {
