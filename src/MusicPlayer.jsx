@@ -7,7 +7,7 @@ import {
   Info, Mic2, ArrowLeft, LayoutGrid, List as ListIcon, ArrowUpDown,
   Clock, TrendingUp, Heart, CheckCircle2, Circle, PictureInPicture2,
   Share2, FolderPlus, Tag, HardDrive, Download, Upload as UploadIcon,
-  Settings, Sparkles
+  Settings, Sparkles, Waves
 } from "lucide-react";
 
 // =====================================================================
@@ -244,6 +244,22 @@ const THEMES = {
 const MILESTONES = [10, 25, 50, 100, 250, 500, 1000];
 const MOOD_TAGS = ["Chill", "Workout", "Study", "Party", "Focus"];
 
+const VINYL_COLORS = {
+  classic: { name: "Classic", base: "#1a1a1a", groove: "#262626", swatch: "#1a1a1a" },
+  ruby: { name: "Ruby", base: "#3a0d14", groove: "#5c1420", swatch: "#8f1d2c" },
+  ocean: { name: "Ocean", base: "#0d1f38", groove: "#16324f", swatch: "#1f6fb2" },
+  forest: { name: "Forest", base: "#132a17", groove: "#1e3f24", swatch: "#2f8f45" },
+  amber: { name: "Amber", base: "#3a2408", groove: "#57350c", swatch: "#c98a1c" },
+  frost: { name: "Frost", base: "#2c2f33", groove: "#3d4147", swatch: "#c9ccd1" },
+};
+const VINYL_BACKDROPS = {
+  studio: { name: "Studio", css: "radial-gradient(circle, #2a2a2a 0%, #0a0a0a 70%)" },
+  warm: { name: "Warm", css: "radial-gradient(circle, #4a2f1c 0%, #140a04 75%)" },
+  cool: { name: "Cool", css: "radial-gradient(circle, #1c2f4a 0%, #04070f 75%)" },
+  sunset: { name: "Sunset", css: "radial-gradient(circle, #4a1c3a 0%, #150512 75%)" },
+  mint: { name: "Mint", css: "radial-gradient(circle, #1c4a35 0%, #04150e 75%)" },
+};
+
 const EQ_PRESETS = {
   Flat: { bass: 0, mid: 0, treble: 0 },
   "Bass Boost": { bass: 7, mid: 1, treble: 0 },
@@ -313,6 +329,14 @@ export default function MusicPlayer() {
   const [normalizeVolume, setNormalizeVolume] = useState(false);
   const [smartContinueEnabled, setSmartContinueEnabled] = useState(true);
   const [vinylMode, setVinylMode] = useState(false);
+  const [vinylColor, setVinylColor] = useState("classic");
+  const [vinylBackdrop, setVinylBackdrop] = useState("studio");
+  const [crackleEnabled, setCrackleEnabled] = useState(false);
+  const [armDragging, setArmDragging] = useState(false);
+  const [armAngleOverride, setArmAngleOverride] = useState(null);
+  const [loopA, setLoopA] = useState(null);
+  const [loopB, setLoopB] = useState(null);
+  const [newPlaylistFromQueue, setNewPlaylistFromQueue] = useState(false);
   const [tagsMap, setTagsMap] = useState({});
   const [activeTagFilter, setActiveTagFilter] = useState(null);
   const [tagSheetTrackId, setTagSheetTrackId] = useState(null);
@@ -343,6 +367,9 @@ export default function MusicPlayer() {
   const analyserRef = useRef(null);
   const masterGainRef = useRef(null);
   const normGainRef = useRef(null);
+  const crackleGainRef = useRef(null);
+  const crackleSourceRef = useRef(null);
+  const crackleBufferRef = useRef(null);
   const normLevelRef = useRef(0.5);
   const normalizeVolumeRef = useRef(false);
   const eqRefs = useRef({});
@@ -351,6 +378,7 @@ export default function MusicPlayer() {
   const sleepFadeTimeoutRef = useRef(null);
   const touchStartY = useRef(0);
   const artTouchStartX = useRef(0);
+  const armDragRef = useRef(null);
   const toastTimer = useRef(null);
   const resumeSeekRef = useRef(null);
   const lastSaveRef = useRef(0);
@@ -382,6 +410,9 @@ export default function MusicPlayer() {
         const tg = await idbGetMeta("tags"); if (tg) setTagsMap(tg);
         const cm = await idbGetMeta("celebratedMilestones"); if (cm) setCelebratedMilestones(cm);
         const th = await idbGetMeta("theme"); if (th) setTheme(th);
+        const vc = await idbGetMeta("vinylColor"); if (vc) setVinylColor(vc);
+        const vb = await idbGetMeta("vinylBackdrop"); if (vb) setVinylBackdrop(vb);
+        const ce = await idbGetMeta("crackleEnabled"); if (ce != null) setCrackleEnabled(ce);
         const ps = await idbGetMeta("positions"); if (ps) setPositions(ps);
         const lk = await idbGetMeta("liked"); if (lk) setLikedIds(lk);
       } catch { /* fresh start */ }
@@ -395,6 +426,9 @@ export default function MusicPlayer() {
   useEffect(() => { if (loaded) idbSetMeta("tags", tagsMap); }, [tagsMap, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("celebratedMilestones", celebratedMilestones); }, [celebratedMilestones, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("theme", theme); }, [theme, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("vinylColor", vinylColor); }, [vinylColor, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("vinylBackdrop", vinylBackdrop); }, [vinylBackdrop, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("crackleEnabled", crackleEnabled); }, [crackleEnabled, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("positions", positions); }, [positions, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("liked", likedIds); }, [likedIds, loaded]);
 
@@ -459,8 +493,11 @@ export default function MusicPlayer() {
     const normGain = ctx.createGain(); normGain.gain.value = 1;
     const masterGain = ctx.createGain(); masterGain.gain.value = 1;
     mix.connect(bass); bass.connect(mid); mid.connect(treble); treble.connect(analyser); analyser.connect(normGain); normGain.connect(masterGain); masterGain.connect(ctx.destination);
+    const crackleGain = ctx.createGain(); crackleGain.gain.value = 0;
+    crackleGain.connect(ctx.destination);
     audioCtxRef.current = ctx; gainARef.current = gainA; gainBRef.current = gainB;
     analyserRef.current = analyser; masterGainRef.current = masterGain; normGainRef.current = normGain;
+    crackleGainRef.current = crackleGain;
     eqRefs.current = { bass, mid, treble };
   }, []);
 
@@ -480,6 +517,46 @@ export default function MusicPlayer() {
     g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(g.gain.value, now); g.gain.linearRampToValueAtTime(target, now + ms / 1000);
     return new Promise((res) => setTimeout(res, ms));
   };
+
+  // WOW (MD Vinyl-inspired) — synthesized vinyl crackle/hiss ambience, looped
+  // quietly under the music while Vinyl Mode + the crackle toggle are on.
+  const buildCrackleBuffer = () => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return null;
+    const len = ctx.sampleRate * 3;
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) {
+      let s = (Math.random() * 2 - 1) * 0.015; // steady hiss floor
+      if (Math.random() < 0.0025) s += (Math.random() * 2 - 1) * 0.35; // occasional pop
+      data[i] = s;
+    }
+    return buf;
+  };
+  const startCrackle = () => {
+    const ctx = audioCtxRef.current, gain = crackleGainRef.current;
+    if (!ctx || !gain || crackleSourceRef.current) return;
+    if (!crackleBufferRef.current) crackleBufferRef.current = buildCrackleBuffer();
+    if (!crackleBufferRef.current) return;
+    const src = ctx.createBufferSource();
+    src.buffer = crackleBufferRef.current;
+    src.loop = true;
+    src.connect(gain);
+    src.start();
+    crackleSourceRef.current = src;
+    gain.gain.cancelScheduledValues(ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(1, ctx.currentTime + 0.4);
+  };
+  const stopCrackle = () => {
+    const ctx = audioCtxRef.current, gain = crackleGainRef.current, src = crackleSourceRef.current;
+    if (gain && ctx) { gain.gain.cancelScheduledValues(ctx.currentTime); gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.3); }
+    if (src) setTimeout(() => { try { src.stop(); } catch {} }, 350);
+    crackleSourceRef.current = null;
+  };
+  useEffect(() => {
+    if (vinylMode && crackleEnabled && isPlaying && audioCtxRef.current) startCrackle();
+    else stopCrackle();
+  }, [vinylMode, crackleEnabled, isPlaying]);
 
   // ------------------------------------------------------------------
   useEffect(() => {
@@ -525,6 +602,15 @@ export default function MusicPlayer() {
           c.fillStyle = "rgba(255,255,255,0.2)"; c.fillRect(0, h / 2 - 1, w, 2);
           c.fillStyle = accent; c.fillRect(0, h / 2 - 1, w * progressRatio, 2);
         }
+        if (loopA != null && dur) {
+          const xA = (loopA / dur) * w;
+          const xB = loopB != null ? (loopB / dur) * w : xA;
+          c.fillStyle = "rgba(255,255,255,0.12)";
+          c.fillRect(xA, 0, Math.max(2, xB - xA), h);
+          c.fillStyle = "#FFD60A";
+          c.fillRect(xA - 1, 0, 2, h);
+          if (loopB != null) c.fillRect(xB - 1, 0, 2, h);
+        }
       }
       if (bgGlowRef.current) {
         bgGlowRef.current.style.transform = `scale(${1 + level * 0.18})`;
@@ -547,7 +633,7 @@ export default function MusicPlayer() {
     };
     rafRef.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [isPlaying, currentTrack, currentTime, duration, accent]);
+  }, [isPlaying, currentTrack, currentTime, duration, accent, loopA, loopB]);
 
   useEffect(() => {
     const resize = () => {
@@ -607,6 +693,7 @@ export default function MusicPlayer() {
     tUrlRef.current = url;
 
     setCurrentTime(0);
+    setLoopA(null); setLoopB(null);
     resumeSeekRef.current = positions[id] > 3 ? positions[id] : (track.trimStart > 0.3 ? track.trimStart : null);
     setRecentlyPlayed((prev) => [{ id, ts: Date.now() }, ...prev.filter((r) => r.id !== id)].slice(0, 200));
     checkMilestone();
@@ -679,6 +766,16 @@ export default function MusicPlayer() {
 
   const cycleRepeat = () => setRepeatMode((m) => (m === "off" ? "all" : m === "all" ? "one" : "off"));
 
+  // WOW — A/B repeat loop: tap once to mark the start, again to mark the
+  // end and start looping that section, a third tap clears it.
+  const handleLoopTap = () => {
+    if (loopA == null) { setLoopA(currentTime); showToast("Loop start set — tap again to set the end"); }
+    else if (loopB == null) {
+      if (currentTime > loopA + 0.5) { setLoopB(currentTime); showToast("Looping section"); }
+      else { setLoopA(null); showToast("Loop cancelled — points too close together"); }
+    } else { setLoopA(null); setLoopB(null); showToast("Loop cleared"); }
+  };
+
   const seekTo = (t) => {
     const a = deckAudio(activeDeckRef.current);
     if (!a) return;
@@ -705,6 +802,7 @@ export default function MusicPlayer() {
     const t = e.target.currentTime;
     setCurrentTime(t);
     if (currentTrack && t - lastSaveRef.current > 5) { lastSaveRef.current = t; setPositions((prev) => ({ ...prev, [currentTrack.id]: t })); }
+    if (loopA != null && loopB != null && t >= loopB) { const a = deckAudio(deck); a.currentTime = loopA; setCurrentTime(loopA); return; }
     const effectiveEnd = duration - (currentTrack?.trimEnd || 0);
     if (isPlaying && !crossfadingRef.current && duration > CROSSFADE_SEC * 2 && effectiveEnd - t <= CROSSFADE_SEC) handleAutoAdvance();
   };
@@ -1018,10 +1116,10 @@ export default function MusicPlayer() {
   const createPlaylist = () => {
     const name = newPlaylistName.trim();
     if (!name) return;
-    const pl = { id: uid(), name, trackIds: [] };
+    const pl = { id: uid(), name, trackIds: newPlaylistFromQueue ? Array.from(new Set(queue)) : [] };
     setPlaylists((prev) => [...prev, pl]);
-    setNewPlaylistName(""); setNewPlaylistSheet(false); setOpenPlaylistId(pl.id);
-    showToast("Playlist created");
+    setNewPlaylistName(""); setNewPlaylistSheet(false); setOpenPlaylistId(pl.id); setNewPlaylistFromQueue(false);
+    showToast(newPlaylistFromQueue ? "Queue saved as playlist" : "Playlist created");
   };
   const deletePlaylist = (id) => { setPlaylists((prev) => prev.filter((p) => p.id !== id)); if (openPlaylistId === id) setOpenPlaylistId(null); showToast("Playlist deleted"); };
   const addToPlaylist = (playlistId, trackId) => {
@@ -1099,6 +1197,11 @@ export default function MusicPlayer() {
         .hscroll > * { scroll-snap-align: start; }
         .fade-in { animation: fadeIn 0.2s ease-out; }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @media (orientation: landscape) and (max-height: 520px) {
+          .np-player-body { flex-direction: row; align-items: center; justify-content: center; gap: 28px; padding-left: 24px; padding-right: 24px; overflow-y: auto; }
+          .np-player-body .np-art { width: 38vh; max-width: 38vh; height: 38vh; flex-shrink: 0; }
+          .np-player-body .np-controls-col { width: auto; max-width: 360px; }
+        }
       `}</style>
 
       {toast && <div className="fade-in absolute top-3 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs font-medium" style={{ background: "rgba(40,40,42,0.95)", zIndex: 70, backdropFilter: "blur(20px)" }}>{toast}</div>}
@@ -1305,6 +1408,7 @@ export default function MusicPlayer() {
               <div className="text-center"><div className="text-[10px] tracking-wider" style={{ color: "#98989D" }}>PLAYING FROM</div><div className="text-xs font-semibold">{queueSource}</div></div>
               <div className="flex items-center gap-3">
                 <button onClick={() => setVinylMode((v) => !v)} className="press p-1"><Disc3 size={19} color={vinylMode ? accent : "#FFFFFF"} /></button>
+                {vinylMode && <button onClick={() => setCrackleEnabled((c) => !c)} className="press p-1" title="Vinyl crackle"><Waves size={18} color={crackleEnabled ? accent : "#FFFFFF"} /></button>}
                 <button onClick={startFloatingPlayer} className="press p-1"><PictureInPicture2 size={17} /></button>
                 <button onClick={() => toggleLike(currentTrack.id)} className="press p-1"><Heart size={19} color={likedIds.includes(currentTrack.id) ? accent : "#FFFFFF"} fill={likedIds.includes(currentTrack.id) ? accent : "none"} /></button>
                 <button onClick={() => setInfoSheetTrackId(currentTrack.id)} className="press p-1"><Info size={19} /></button>
@@ -1312,33 +1416,85 @@ export default function MusicPlayer() {
             </div>
 
             {npView === "player" && (
-              <div className="flex-1 flex flex-col items-center justify-center px-8 gap-6 overflow-y-auto">
-                <div className="w-full max-w-xs aspect-square rounded-2xl overflow-hidden shadow-2xl" onTouchStart={onArtTouchStart} onTouchMove={onArtTouchMove} onTouchEnd={onArtTouchEnd}
+              <div className="np-player-body flex-1 flex flex-col items-center justify-center px-8 gap-6 overflow-y-auto">
+                <div className="np-art w-full max-w-xs aspect-square rounded-2xl overflow-hidden shadow-2xl" onTouchStart={vinylMode ? undefined : onArtTouchStart} onTouchMove={vinylMode ? undefined : onArtTouchMove} onTouchEnd={vinylMode ? undefined : onArtTouchEnd}
                   style={{ transform: `translateX(${artSwipeX}px)`, transition: artSwipeX === 0 ? `transform 0.25s ${SPRING}` : "none" }}>
-                  {vinylMode ? (
-                    <div className="w-full h-full flex items-center justify-center" style={{ background: "radial-gradient(circle, #2a2a2a 0%, #0a0a0a 70%)" }}>
-                      <div className="rounded-full relative" style={{
-                        width: "88%", height: "88%",
-                        background: "repeating-radial-gradient(circle, #1a1a1a 0px, #1a1a1a 2px, #262626 3px, #1a1a1a 4px)",
-                        animation: isPlaying ? "spin 3.5s linear infinite" : "none",
-                        boxShadow: "0 10px 40px rgba(0,0,0,0.6)",
-                      }}>
-                        <div className="absolute rounded-full overflow-hidden" style={{ width: "38%", height: "38%", top: "31%", left: "31%", boxShadow: "0 0 0 3px #0a0a0a" }}>
-                          <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">
-                            {!currentTrack.artUrl && <Disc3 size={30} color="rgba(255,255,255,0.5)" />}
-                          </ArtBox>
+                  {vinylMode ? (() => {
+                    const vc = VINYL_COLORS[vinylColor] || VINYL_COLORS.classic;
+                    const vb = VINYL_BACKDROPS[vinylBackdrop] || VINYL_BACKDROPS.studio;
+                    const progress = duration > 0 ? currentTime / duration : 0;
+                    const restAngle = -18, engagedBase = 8, engagedEnd = 32;
+                    const engagedAngle = engagedBase + progress * (engagedEnd - engagedBase);
+                    const displayAngle = armDragging && armAngleOverride != null ? armAngleOverride : (isPlaying ? engagedAngle : restAngle);
+
+                    const onArmTouchStart = (e) => {
+                      armDragRef.current = { startX: e.touches[0].clientX, baseline: isPlaying ? 1 : 0, engagement: isPlaying ? 1 : 0 };
+                      setArmDragging(true);
+                    };
+                    const onArmTouchMove = (e) => {
+                      if (!armDragRef.current) return;
+                      const dx = e.touches[0].clientX - armDragRef.current.startX;
+                      const engagement = Math.max(0, Math.min(1, armDragRef.current.baseline + dx / 80));
+                      armDragRef.current.engagement = engagement;
+                      setArmAngleOverride(restAngle + engagement * (engagedAngle - restAngle));
+                    };
+                    const onArmTouchEnd = () => {
+                      const engagement = armDragRef.current?.engagement ?? (isPlaying ? 1 : 0);
+                      if (engagement > 0.5) { if (!isPlaying) togglePlay(); }
+                      else { if (isPlaying) togglePlay(); }
+                      armDragRef.current = null;
+                      setArmDragging(false);
+                      setArmAngleOverride(null);
+                    };
+
+                    return (
+                      <div className="w-full h-full flex items-center justify-center relative" style={{ background: vb.css }}>
+                        <div className="rounded-full relative" style={{
+                          width: "88%", height: "88%",
+                          background: `repeating-radial-gradient(circle, ${vc.base} 0px, ${vc.base} 2px, ${vc.groove} 3px, ${vc.base} 4px)`,
+                          animation: isPlaying ? "spin 3.5s linear infinite" : "none",
+                          boxShadow: "0 10px 40px rgba(0,0,0,0.6)",
+                        }}>
+                          <div className="absolute rounded-full overflow-hidden" style={{ width: "38%", height: "38%", top: "31%", left: "31%", boxShadow: "0 0 0 3px #0a0a0a" }}>
+                            <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">
+                              {!currentTrack.artUrl && <Disc3 size={30} color="rgba(255,255,255,0.5)" />}
+                            </ArtBox>
+                          </div>
+                          <div className="absolute rounded-full" style={{ width: 10, height: 10, top: "50%", left: "50%", transform: "translate(-50%,-50%)", background: "#0a0a0a" }} />
                         </div>
-                        <div className="absolute rounded-full" style={{ width: 10, height: 10, top: "50%", left: "50%", transform: "translate(-50%,-50%)", background: "#0a0a0a" }} />
+
+                        {/* Interactive tonearm — drag it onto the record to play, off to pause */}
+                        <div className="absolute" style={{ top: "2%", right: "4%", width: "46%", height: "46%", transformOrigin: "88% 12%", transform: `rotate(${displayAngle}deg)`, transition: armDragging ? "none" : `transform 0.4s ${SPRING}`, zIndex: 5 }}>
+                          <div style={{ position: "absolute", top: "8%", right: "8%", width: 22, height: 22, borderRadius: "50%", background: "#3a3a3d", boxShadow: "0 2px 6px rgba(0,0,0,0.5)" }} />
+                          <div style={{ position: "absolute", top: "16%", right: "16%", width: 5, height: "72%", background: "linear-gradient(#5a5a5d, #3a3a3d)", borderRadius: 3, transformOrigin: "top center" }} />
+                          <div
+                            onTouchStart={onArmTouchStart} onTouchMove={onArmTouchMove} onTouchEnd={onArmTouchEnd} onClick={(e) => e.stopPropagation()}
+                            style={{ position: "absolute", bottom: "6%", left: "2%", width: 20, height: 20, borderRadius: "50%", background: "#c9a227", boxShadow: "0 2px 6px rgba(0,0,0,0.5)", cursor: "grab" }}
+                          />
+                        </div>
+
+                        <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+
+                        {/* Quick vinyl color + backdrop swatches */}
+                        <div className="absolute left-0 right-0 flex items-center justify-center gap-1.5" style={{ bottom: 8 }}>
+                          {Object.entries(VINYL_COLORS).map(([key, v]) => (
+                            <button key={key} onClick={(e) => { e.stopPropagation(); setVinylColor(key); }} className="press rounded-full shrink-0" style={{ width: 16, height: 16, background: v.swatch, border: vinylColor === key ? "2px solid #fff" : "2px solid rgba(255,255,255,0.3)" }} />
+                          ))}
+                          <span style={{ width: 1, height: 14, background: "rgba(255,255,255,0.25)", margin: "0 2px" }} />
+                          {Object.entries(VINYL_BACKDROPS).map(([key, v]) => (
+                            <button key={key} onClick={(e) => { e.stopPropagation(); setVinylBackdrop(key); }} className="press rounded-full shrink-0" style={{ width: 16, height: 16, background: v.css, border: vinylBackdrop === key ? "2px solid #fff" : "2px solid rgba(255,255,255,0.3)" }} />
+                          ))}
+                        </div>
                       </div>
-                      <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
-                    </div>
-                  ) : (
+                    );
+                  })() : (
                     <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">
                       {!currentTrack.artUrl && <Disc3 size={70} color="rgba(255,255,255,0.55)" className={isPlaying ? "animate-spin" : ""} style={{ animationDuration: "4s" }} />}
                     </ArtBox>
                   )}
                 </div>
 
+                <div className="np-controls-col flex flex-col items-center gap-6 w-full">
                 <div className="text-center w-full">
                   <div className="text-xl font-bold truncate">{currentTrack.name}</div>
                   <div className="text-xs mt-1" style={{ color: "#98989D" }}>{currentTrack.ext} · lossless passthrough</div>
@@ -1365,8 +1521,9 @@ export default function MusicPlayer() {
                   <input type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} onChange={onVolumeChange} className="flex-1" />
                 </div>
 
-                <div className="flex items-center gap-10 pb-2">
+                <div className="flex items-center gap-6 pb-2">
                   <button onClick={() => setNpView("lyrics")} className="press flex flex-col items-center gap-1" style={{ color: "#98989D" }}><Mic2 size={18} /><span className="text-[10px]">Lyrics</span></button>
+                  <button onClick={handleLoopTap} className="press flex flex-col items-center gap-1" style={{ color: loopA != null ? accent : "#98989D" }}><Repeat size={18} /><span className="text-[10px]">{loopB != null ? "Looping" : loopA != null ? "Set End" : "A-B Loop"}</span></button>
                   <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); }} className="press flex flex-col items-center gap-1" style={{ color: sleepEndsAt ? accent : "#98989D" }}><Moon size={18} /><span className="text-[10px]">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
                   <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); }} className="press flex flex-col items-center gap-1" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? accent : "#98989D" }}><SlidersHorizontal size={18} /><span className="text-[10px]">EQ</span></button>
                   <button onClick={() => setNpView("queue")} className="press flex flex-col items-center gap-1" style={{ color: "#98989D" }}><ListMusic size={18} /><span className="text-[10px]">Up Next</span></button>
@@ -1397,6 +1554,7 @@ export default function MusicPlayer() {
                   </div>
                 )}
               </div>
+              </div>
             )}
 
             {npView === "queue" && (
@@ -1404,6 +1562,7 @@ export default function MusicPlayer() {
                 <div className="flex items-center justify-between px-3 py-2">
                   <button onClick={() => setNpView("player")} className="press flex items-center gap-1 text-sm font-medium"><ChevronDown size={17} /> Back</button>
                   <span className="text-xs tracking-widest" style={{ color: "#98989D" }}>UP NEXT · drag to reorder</span>
+                  <button onClick={() => { setNewPlaylistFromQueue(true); setNewPlaylistSheet(true); }} className="press text-xs font-medium" style={{ color: "#FA2D48" }}>Save</button>
                 </div>
                 {queue.map((id, i) => {
                   const t = library.find((tt) => tt.id === id);
@@ -1488,10 +1647,10 @@ export default function MusicPlayer() {
       })()}
 
       {newPlaylistSheet && (
-        <BottomSheetBackdrop bg={sheetBg} onClose={() => setNewPlaylistSheet(false)}>
+        <BottomSheetBackdrop bg={sheetBg} onClose={() => { setNewPlaylistSheet(false); setNewPlaylistFromQueue(false); }}>
           <SheetHandle />
           <div className="px-5 pb-4">
-            <div className="text-sm font-semibold mb-3">New Playlist</div>
+            <div className="text-sm font-semibold mb-3">{newPlaylistFromQueue ? "Save Queue as Playlist" : "New Playlist"}</div>
             <div className="flex items-center gap-2">
               <input autoFocus value={newPlaylistName} onChange={(e) => setNewPlaylistName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && createPlaylist()} placeholder="Playlist name" className="flex-1 px-3 py-2.5 rounded-lg outline-none text-sm" style={{ background: "#2C2C2E", color: "#FFFFFF" }} />
               <button onClick={createPlaylist} className="press px-4 py-2.5 rounded-lg text-sm font-semibold" style={{ background: "#FA2D48", color: "#FFFFFF" }}>Create</button>
