@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import {
   Play, Pause, SkipBack, SkipForward, Shuffle, Repeat, Repeat1,
   Upload, Plus, Trash2, Music, ListMusic, Volume2, VolumeX, X,
@@ -7,7 +7,7 @@ import {
   Info, Mic2, ArrowLeft, LayoutGrid, List as ListIcon, ArrowUpDown,
   Clock, TrendingUp, Heart, CheckCircle2, Circle, PictureInPicture2,
   Share2, FolderPlus, Tag, HardDrive, Download, Upload as UploadIcon,
-  Settings, Sparkles, Waves
+  Settings, Sparkles, Waves, Wind, Gauge
 } from "lucide-react";
 
 // =====================================================================
@@ -251,6 +251,10 @@ const VINYL_COLORS = {
   forest: { name: "Forest", base: "#132a17", groove: "#1e3f24", swatch: "#2f8f45" },
   amber: { name: "Amber", base: "#3a2408", groove: "#57350c", swatch: "#c98a1c" },
   frost: { name: "Frost", base: "#2c2f33", groove: "#3d4147", swatch: "#c9ccd1" },
+  gold: { name: "Gold", base: "#2e2306", groove: "#4a3708", swatch: "#e0ac2b" },
+  marble: { name: "Marble", base: "#28282c", groove: "#c9c9d1", swatch: "#a8a8b3" },
+  neon: { name: "Neon", base: "#160321", groove: "#3d0a5c", swatch: "#c026ff" },
+  sunburst: { name: "Sunburst", base: "#3a1006", groove: "#7a2c0a", swatch: "#ff7a1a" },
 };
 const VINYL_BACKDROPS = {
   studio: { name: "Studio", css: "radial-gradient(circle, #2a2a2a 0%, #0a0a0a 70%)" },
@@ -258,7 +262,12 @@ const VINYL_BACKDROPS = {
   cool: { name: "Cool", css: "radial-gradient(circle, #1c2f4a 0%, #04070f 75%)" },
   sunset: { name: "Sunset", css: "radial-gradient(circle, #4a1c3a 0%, #150512 75%)" },
   mint: { name: "Mint", css: "radial-gradient(circle, #1c4a35 0%, #04150e 75%)" },
+  velvet: { name: "Velvet", css: "radial-gradient(circle, #350f2e 0%, #0c0209 75%)" },
+  wood: { name: "Wood", css: "radial-gradient(circle, #4a3420 0%, #170e06 75%)" },
+  brick: { name: "Brick", css: "radial-gradient(circle, #4a2016 0%, #150705 75%)" },
+  noir: { name: "Noir", css: "radial-gradient(circle, #202225 0%, #000000 78%)" },
 };
+const RPM_SPEEDS = { 33: 3.5, 45: 2.6 };
 
 const EQ_PRESETS = {
   Flat: { bass: 0, mid: 0, treble: 0 },
@@ -334,6 +343,14 @@ export default function MusicPlayer() {
   const [crackleEnabled, setCrackleEnabled] = useState(false);
   const [armDragging, setArmDragging] = useState(false);
   const [armAngleOverride, setArmAngleOverride] = useState(null);
+  // Vinyl Mode 2.0 — RPM, ambience & interaction upgrades
+  const [vinylRPM, setVinylRPM] = useState(33);
+  const [vinylShine, setVinylShine] = useState(true);
+  const [vinylDust, setVinylDust] = useState(true);
+  const [vinylReactive, setVinylReactive] = useState(true);
+  const [showVinylPanel, setShowVinylPanel] = useState(false);
+  const [scratchDragging, setScratchDragging] = useState(false);
+  const [scratchAngle, setScratchAngle] = useState(0);
   const [loopA, setLoopA] = useState(null);
   const [loopB, setLoopB] = useState(null);
   const [newPlaylistFromQueue, setNewPlaylistFromQueue] = useState(false);
@@ -379,6 +396,8 @@ export default function MusicPlayer() {
   const touchStartY = useRef(0);
   const artTouchStartX = useRef(0);
   const armDragRef = useRef(null);
+  const vinylPulseRef = useRef(null);
+  const scratchRef = useRef(null);
   const toastTimer = useRef(null);
   const resumeSeekRef = useRef(null);
   const lastSaveRef = useRef(0);
@@ -413,6 +432,10 @@ export default function MusicPlayer() {
         const vc = await idbGetMeta("vinylColor"); if (vc) setVinylColor(vc);
         const vb = await idbGetMeta("vinylBackdrop"); if (vb) setVinylBackdrop(vb);
         const ce = await idbGetMeta("crackleEnabled"); if (ce != null) setCrackleEnabled(ce);
+        const vr = await idbGetMeta("vinylRPM"); if (vr) setVinylRPM(vr);
+        const vsh = await idbGetMeta("vinylShine"); if (vsh != null) setVinylShine(vsh);
+        const vd = await idbGetMeta("vinylDust"); if (vd != null) setVinylDust(vd);
+        const vre = await idbGetMeta("vinylReactive"); if (vre != null) setVinylReactive(vre);
         const ps = await idbGetMeta("positions"); if (ps) setPositions(ps);
         const lk = await idbGetMeta("liked"); if (lk) setLikedIds(lk);
       } catch { /* fresh start */ }
@@ -429,6 +452,10 @@ export default function MusicPlayer() {
   useEffect(() => { if (loaded) idbSetMeta("vinylColor", vinylColor); }, [vinylColor, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("vinylBackdrop", vinylBackdrop); }, [vinylBackdrop, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("crackleEnabled", crackleEnabled); }, [crackleEnabled, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("vinylRPM", vinylRPM); }, [vinylRPM, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("vinylShine", vinylShine); }, [vinylShine, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("vinylDust", vinylDust); }, [vinylDust, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("vinylReactive", vinylReactive); }, [vinylReactive, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("positions", positions); }, [positions, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("liked", likedIds); }, [likedIds, loaded]);
 
@@ -440,6 +467,18 @@ export default function MusicPlayer() {
     return () => { cancelled = true; };
   }, [currentTrack?.id, currentTrack?.artUrl]);
   const accent = themeColor ? `rgb(${themeColor.r},${themeColor.g},${themeColor.b})` : currentTrack ? `hsl(${artHue(currentTrack.name)} 70% 55%)` : "#FA2D48";
+
+  // Vinyl Mode 2.0 — floating dust-mote positions, generated once so the
+  // ambience doesn't jitter/reshuffle on every re-render (currentTime ticks).
+  const dustMotes = useMemo(() => Array.from({ length: 16 }, (_, i) => ({
+    id: i,
+    left: Math.random() * 100,
+    top: Math.random() * 100,
+    size: 1 + Math.random() * 2.2,
+    dur: 7 + Math.random() * 9,
+    delay: -Math.random() * 12,
+    drift: (Math.random() - 0.5) * 40,
+  })), []);
 
   // ------------------------------------------------------------------
   const recentlyAdded = [...library].sort((a, b) => b.addedAt - a.addedAt).slice(0, 25);
@@ -558,6 +597,27 @@ export default function MusicPlayer() {
     else stopCrackle();
   }, [vinylMode, crackleEnabled, isPlaying]);
 
+  // Synthesized tonearm needle drop/lift click — a short filtered noise
+  // transient that fires when the stylus touches down or lifts off the
+  // record, adding tactile realism to the drag-to-play tonearm gesture.
+  const playNeedleClick = (kind = "down") => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    const dur = 0.05;
+    const buf = ctx.createBuffer(1, ctx.sampleRate * dur, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / data.length, 2);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const filter = ctx.createBiquadFilter();
+    filter.type = kind === "down" ? "lowpass" : "highpass";
+    filter.frequency.value = kind === "down" ? 1200 : 2600;
+    const g = ctx.createGain();
+    g.gain.value = kind === "down" ? 0.5 : 0.3;
+    src.connect(filter); filter.connect(g); g.connect(ctx.destination);
+    src.start();
+  };
+
   // ------------------------------------------------------------------
   useEffect(() => {
     const draw = () => {
@@ -616,6 +676,16 @@ export default function MusicPlayer() {
         bgGlowRef.current.style.transform = `scale(${1 + level * 0.18})`;
         bgGlowRef.current.style.opacity = String(0.5 + level * 0.35);
       }
+      // Vinyl Mode 2.0 — the record subtly breathes/glows with the music,
+      // driven directly on the DOM node (no re-render) for smooth 60fps feel.
+      if (vinylPulseRef.current) {
+        if (vinylMode && vinylReactive && isPlaying) {
+          vinylPulseRef.current.style.opacity = String(0.18 + level * 0.55);
+          vinylPulseRef.current.style.transform = `scale(${1 + level * 0.07})`;
+        } else {
+          vinylPulseRef.current.style.opacity = "0";
+        }
+      }
       // WOW — loudness normalization: gently nudge gain so quiet and loud
       // tracks land closer to a similar perceived volume.
       if (normGainRef.current && audioCtxRef.current) {
@@ -633,7 +703,7 @@ export default function MusicPlayer() {
     };
     rafRef.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [isPlaying, currentTrack, currentTime, duration, accent, loopA, loopB]);
+  }, [isPlaying, currentTrack, currentTime, duration, accent, loopA, loopB, vinylMode, vinylReactive]);
 
   useEffect(() => {
     const resize = () => {
@@ -787,6 +857,47 @@ export default function MusicPlayer() {
     const rect = waveCanvasRef.current.getBoundingClientRect();
     seekTo(((e.clientX - rect.left) / rect.width) * duration);
   };
+
+  // Vinyl Mode 2.0 — grab the spinning record itself and scrub/scratch
+  // through the track like a real turntable, complete with needle
+  // drop/lift clicks and a pause-while-scratching feel.
+  const angleFromCenter = (touch, rect) => {
+    const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+    return { angle: Math.atan2(touch.clientY - cy, touch.clientX - cx) * (180 / Math.PI), cx, cy };
+  };
+  const onDiscTouchStart = (e) => {
+    if (!currentTrack) return;
+    e.stopPropagation();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const { angle, cx, cy } = angleFromCenter(e.touches[0], rect);
+    const wasPlaying = isPlaying;
+    if (wasPlaying) { const a = deckAudio(activeDeckRef.current); a.pause(); setIsPlaying(false); }
+    scratchRef.current = { cx, cy, lastAngle: angle, wasPlaying };
+    setScratchDragging(true);
+    setScratchAngle(0);
+    playNeedleClick("down");
+  };
+  const onDiscTouchMove = (e) => {
+    if (!scratchRef.current) return;
+    e.stopPropagation();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const { angle } = angleFromCenter(e.touches[0], rect);
+    let delta = angle - scratchRef.current.lastAngle;
+    if (delta > 180) delta -= 360; else if (delta < -180) delta += 360;
+    scratchRef.current.lastAngle = angle;
+    setScratchAngle((a) => a + delta);
+    seekTo(currentTime + delta * 0.05);
+  };
+  const onDiscTouchEnd = (e) => {
+    if (!scratchRef.current) return;
+    e.stopPropagation();
+    const wasPlaying = scratchRef.current.wasPlaying;
+    scratchRef.current = null;
+    setScratchDragging(false);
+    setScratchAngle(0);
+    playNeedleClick("up");
+    if (wasPlaying) { const a = deckAudio(activeDeckRef.current); a.play().catch(() => {}); setIsPlaying(true); }
+  };
   const onVolumeChange = (e) => {
     const v = Number(e.target.value); setVolume(v); setMuted(false);
     if (masterGainRef.current) {} // master gain reserved for fades; user volume applied per element below
@@ -919,10 +1030,25 @@ export default function MusicPlayer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nowPlayingOpen, contextTrackId, addSheetTrackId, infoSheetTrackId, newPlaylistSheet, bulkAddSheetOpen, showStats, showSettings, tagSheetTrackId]);
 
-  // WOW — dynamic status bar / PWA chrome color that matches the playing track
+  // WOW — dynamic status bar / PWA chrome color that hints at the playing
+  // track's color without ever looking off — blended heavily toward black
+  // so it always stays dark and cohesive with the rest of the app.
   useEffect(() => {
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute("content", currentTrack ? accent : palette.bg);
+    if (!meta) return;
+    if (!currentTrack) { meta.setAttribute("content", palette.bg); return; }
+    let statusColor = palette.bg;
+    const rgbMatch = accent.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+    const hslMatch = accent.match(/hsl\((\d+)\s+(\d+)%\s+(\d+)%\)/);
+    if (rgbMatch) {
+      const r = Math.round(parseInt(rgbMatch[1]) * 0.22);
+      const g = Math.round(parseInt(rgbMatch[2]) * 0.22);
+      const b = Math.round(parseInt(rgbMatch[3]) * 0.22);
+      statusColor = `rgb(${r},${g},${b})`;
+    } else if (hslMatch) {
+      statusColor = `hsl(${hslMatch[1]} 40% 12%)`;
+    }
+    meta.setAttribute("content", statusColor);
   }, [accent, currentTrack, palette.bg]);
 
   const setSleepMinutes = (mins) => {
@@ -1250,7 +1376,7 @@ export default function MusicPlayer() {
 
       {toast && <div className="fade-in absolute top-3 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs font-medium" style={{ background: "rgba(40,40,42,0.95)", zIndex: 70, backdropFilter: "blur(20px)" }}>{toast}</div>}
 
-      <header className={`glass flex items-center justify-between px-4 shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 54, color: palette.text }}>
+      <header className="flex items-center justify-between px-4 shrink-0" style={{ height: 54, background: palette.bg, color: palette.text }}>
         <h1 className="text-2xl font-extrabold tracking-tight">{activeTab === "home" ? "Home" : activeTab === "library" ? (openPlaylistId ? "" : "Library") : "Search"}</h1>
         {!openPlaylistId && (
           <div className="flex items-center gap-2">
@@ -1414,7 +1540,7 @@ export default function MusicPlayer() {
       </main>
 
       {currentTrack && !nowPlayingOpen && !selectMode && (
-        <div onClick={() => setNowPlayingOpen(true)} className={`glass press press-3d absolute left-2 right-2 flex items-center gap-3 px-3 rounded-2xl fade-in ${theme === "light" ? "glass-light" : ""}`} style={{ bottom: 66, height: 60, zIndex: 20, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)" }}>
+        <div onClick={() => setNowPlayingOpen(true)} className={`glass press press-3d absolute left-2 right-2 flex items-center gap-3 px-3 rounded-2xl fade-in ${theme === "light" ? "glass-light" : ""}`} style={{ bottom: 66, height: 60, zIndex: 20, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)", boxShadow: "0 4px 14px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.18)" }}>
           <ArtBox track={currentTrack} className="w-9 h-9 rounded-lg shrink-0" />
           <div className="flex-1 min-w-0 text-left"><div className="text-sm font-medium truncate">{currentTrack.name}</div></div>
           {isPlaying && <div className="flex items-end gap-0.5 h-4 shrink-0"><div className="eq-bar" style={{ animationDelay: "0s" }} /><div className="eq-bar" style={{ animationDelay: "0.2s" }} /><div className="eq-bar" style={{ animationDelay: "0.4s" }} /></div>}
@@ -1433,7 +1559,7 @@ export default function MusicPlayer() {
         </div>
       )}
 
-      <nav className={`glass absolute left-0 right-0 bottom-0 flex items-stretch ${theme === "light" ? "glass-light" : ""}`} style={{ height: 66, zIndex: 21, border: "none", borderTop: `1px solid ${theme === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.1)"}`, boxShadow: "0 -8px 24px rgba(0,0,0,0.3)" }}>
+      <nav className={`glass absolute left-0 right-0 bottom-0 flex items-stretch ${theme === "light" ? "glass-light" : ""}`} style={{ height: 66, zIndex: 21, border: "none", borderTop: `1px solid ${theme === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.1)"}`, boxShadow: "none" }}>
         {[["home", "Home", <Home size={22} />], ["library", "Library", <LibraryIcon size={22} />], ["search", "Search", <Search size={22} />]].map(([key, label, icon]) => (
           <button key={key} onClick={() => { setActiveTab(key); if (key !== "library") setOpenPlaylistId(null); clearSelection(); }} className="press flex-1 flex flex-col items-center justify-center gap-1" style={{ color: activeTab === key ? "#FA2D48" : "#98989D" }}>{icon}<span className="text-[10px] font-medium">{label}</span></button>
         ))}
@@ -1470,19 +1596,26 @@ export default function MusicPlayer() {
                     const restAngle = -18, engagedBase = 8, engagedEnd = 32;
                     const engagedAngle = engagedBase + progress * (engagedEnd - engagedBase);
                     const displayAngle = armDragging && armAngleOverride != null ? armAngleOverride : (isPlaying ? engagedAngle : restAngle);
+                    const spinDuration = RPM_SPEEDS[vinylRPM] || RPM_SPEEDS[33];
+                    const labelPathId = `vinylLabelPath-${currentTrack.id}`;
+                    const glowColor = themeColor ? `rgba(${themeColor.r},${themeColor.g},${themeColor.b},0.45)` : `hsla(${artHue(currentTrack.name)}, 70%, 55%, 0.45)`;
 
                     const onArmTouchStart = (e) => {
+                      e.stopPropagation();
                       armDragRef.current = { startX: e.touches[0].clientX, baseline: isPlaying ? 1 : 0, engagement: isPlaying ? 1 : 0 };
                       setArmDragging(true);
+                      playNeedleClick(isPlaying ? "up" : "down");
                     };
                     const onArmTouchMove = (e) => {
+                      e.stopPropagation();
                       if (!armDragRef.current) return;
                       const dx = e.touches[0].clientX - armDragRef.current.startX;
                       const engagement = Math.max(0, Math.min(1, armDragRef.current.baseline + dx / 80));
                       armDragRef.current.engagement = engagement;
                       setArmAngleOverride(restAngle + engagement * (engagedAngle - restAngle));
                     };
-                    const onArmTouchEnd = () => {
+                    const onArmTouchEnd = (e) => {
+                      e.stopPropagation();
                       const engagement = armDragRef.current?.engagement ?? (isPlaying ? 1 : 0);
                       if (engagement > 0.5) { if (!isPlaying) togglePlay(); }
                       else { if (isPlaying) togglePlay(); }
@@ -1493,18 +1626,49 @@ export default function MusicPlayer() {
 
                     return (
                       <div className="w-full h-full flex items-center justify-center relative" style={{ background: vb.css }}>
-                        <div className="rounded-full relative" style={{
-                          width: "88%", height: "88%",
-                          background: `repeating-radial-gradient(circle, ${vc.base} 0px, ${vc.base} 2px, ${vc.groove} 3px, ${vc.base} 4px)`,
-                          animation: isPlaying ? "spin 3.5s linear infinite" : "none",
-                          boxShadow: "0 10px 40px rgba(0,0,0,0.6)",
-                        }}>
-                          <div className="absolute rounded-full overflow-hidden" style={{ width: "38%", height: "38%", top: "31%", left: "31%", boxShadow: "0 0 0 3px #0a0a0a" }}>
+                        {/* Reactive glow — the record breathes with the music */}
+                        <div ref={vinylPulseRef} className="absolute rounded-full pointer-events-none" style={{ width: "94%", height: "94%", background: `radial-gradient(circle, ${glowColor}, transparent 72%)`, opacity: 0, filter: "blur(18px)", transition: "opacity 0.15s linear" }} />
+
+                        <div
+                          className="rounded-full relative"
+                          onTouchStart={onDiscTouchStart} onTouchMove={onDiscTouchMove} onTouchEnd={onDiscTouchEnd}
+                          style={{
+                            width: "88%", height: "88%",
+                            background: `repeating-radial-gradient(circle, ${vc.base} 0px, ${vc.base} 2px, ${vc.groove} 3px, ${vc.base} 4px)`,
+                            animation: !scratchDragging && isPlaying ? `spin ${spinDuration}s linear infinite` : "none",
+                            transform: scratchDragging ? `rotate(${scratchAngle}deg)` : undefined,
+                            boxShadow: "0 10px 40px rgba(0,0,0,0.6)",
+                            cursor: "grab",
+                            touchAction: "none",
+                          }}
+                        >
+                          {/* Curved run-out text — a bit of vinyl label typography */}
+                          <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full" style={{ pointerEvents: "none" }}>
+                            <defs>
+                              <path id={labelPathId} d="M 50,50 m -33,0 a 33,33 0 1,1 66,0 a 33,33 0 1,1 -66,0" />
+                            </defs>
+                            <text fill="rgba(255,255,255,0.32)" fontSize="3.1" letterSpacing="2">
+                              <textPath href={`#${labelPathId}`} startOffset="0%">
+                                {(currentTrack.name || "SPOOL").toUpperCase()} • SPOOL VINYL •{" "}
+                              </textPath>
+                            </text>
+                          </svg>
+
+                          <div className="absolute rounded-full overflow-hidden" style={{ width: "38%", height: "38%", top: "31%", left: "31%", boxShadow: `0 0 0 3px #0a0a0a, 0 0 0 4px ${vc.groove}` }}>
                             <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">
                               {!currentTrack.artUrl && <Disc3 size={30} color="rgba(255,255,255,0.5)" />}
                             </ArtBox>
                           </div>
                           <div className="absolute rounded-full" style={{ width: 10, height: 10, top: "50%", left: "50%", transform: "translate(-50%,-50%)", background: "#0a0a0a" }} />
+
+                          {/* Specular sheen sweep — a soft light glint that rides the disc */}
+                          {vinylShine && (
+                            <div className="absolute inset-0 rounded-full pointer-events-none" style={{
+                              background: "conic-gradient(from 0deg, transparent 0%, rgba(255,255,255,0.24) 6%, transparent 16%, transparent 82%, rgba(255,255,255,0.12) 92%, transparent 100%)",
+                              animation: "vinylShine 7s linear infinite",
+                              mixBlendMode: "screen",
+                            }} />
+                          )}
                         </div>
 
                         {/* Interactive tonearm — drag it onto the record to play, off to pause */}
@@ -1517,17 +1681,41 @@ export default function MusicPlayer() {
                           />
                         </div>
 
-                        <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+                        {/* Floating dust motes for ambience */}
+                        {vinylDust && (
+                          <div className="absolute inset-0 overflow-hidden rounded-2xl pointer-events-none" style={{ zIndex: 3 }}>
+                            {dustMotes.map((d) => (
+                              <div key={d.id} style={{
+                                position: "absolute", left: `${d.left}%`, top: `${d.top}%`,
+                                width: d.size, height: d.size, borderRadius: "50%",
+                                background: "rgba(255,255,255,0.55)",
+                                animation: `dustFloat ${d.dur}s ease-in-out ${d.delay}s infinite`,
+                                "--drift": `${d.drift}px`,
+                              }} />
+                            ))}
+                          </div>
+                        )}
+
+                        <style>{`
+                          @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+                          @keyframes vinylShine { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+                          @keyframes dustFloat { 0%, 100% { transform: translate(0, 0); opacity: 0.12; } 50% { transform: translate(var(--drift), -16px); opacity: 0.6; } }
+                          .vinyl-swatch-row::-webkit-scrollbar { display: none; }
+                        `}</style>
 
                         {/* Quick vinyl color + backdrop swatches */}
-                        <div className="absolute left-0 right-0 flex items-center justify-center gap-1.5" style={{ bottom: 8 }}>
+                        <div className="vinyl-swatch-row absolute left-0 right-0 flex items-center justify-center gap-1.5 overflow-x-auto px-3" style={{ bottom: 8, scrollbarWidth: "none" }}>
                           {Object.entries(VINYL_COLORS).map(([key, v]) => (
                             <button key={key} onClick={(e) => { e.stopPropagation(); setVinylColor(key); }} className="press rounded-full shrink-0" style={{ width: 16, height: 16, background: v.swatch, border: vinylColor === key ? "2px solid #fff" : "2px solid rgba(255,255,255,0.3)" }} />
                           ))}
-                          <span style={{ width: 1, height: 14, background: "rgba(255,255,255,0.25)", margin: "0 2px" }} />
+                          <span style={{ width: 1, height: 14, background: "rgba(255,255,255,0.25)", margin: "0 2px", flexShrink: 0 }} />
                           {Object.entries(VINYL_BACKDROPS).map(([key, v]) => (
                             <button key={key} onClick={(e) => { e.stopPropagation(); setVinylBackdrop(key); }} className="press rounded-full shrink-0" style={{ width: 16, height: 16, background: v.css, border: vinylBackdrop === key ? "2px solid #fff" : "2px solid rgba(255,255,255,0.3)" }} />
                           ))}
+                          <span style={{ width: 1, height: 14, background: "rgba(255,255,255,0.25)", margin: "0 2px", flexShrink: 0 }} />
+                          <button onClick={(e) => { e.stopPropagation(); setShowVinylPanel((s) => !s); setShowEq(false); setShowSleep(false); }} className="press rounded-full shrink-0 flex items-center justify-center" style={{ width: 18, height: 18, background: showVinylPanel ? accent : "rgba(255,255,255,0.15)" }}>
+                            <Settings size={11} color="#fff" />
+                          </button>
                         </div>
                       </div>
                     );
@@ -1571,10 +1759,29 @@ export default function MusicPlayer() {
                 <div className="flex items-center gap-6 pb-2">
                   <button onClick={() => setNpView("lyrics")} className="press flex flex-col items-center gap-1" style={{ color: "#98989D" }}><Mic2 size={18} /><span className="text-[10px]">Lyrics</span></button>
                   <button onClick={handleLoopTap} className="press flex flex-col items-center gap-1" style={{ color: loopA != null ? accent : "#98989D" }}><Repeat size={18} /><span className="text-[10px]">{loopB != null ? "Looping" : loopA != null ? "Set End" : "A-B Loop"}</span></button>
-                  <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); }} className="press flex flex-col items-center gap-1" style={{ color: sleepEndsAt ? accent : "#98989D" }}><Moon size={18} /><span className="text-[10px]">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
-                  <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); }} className="press flex flex-col items-center gap-1" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? accent : "#98989D" }}><SlidersHorizontal size={18} /><span className="text-[10px]">EQ</span></button>
+                  <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); setShowVinylPanel(false); }} className="press flex flex-col items-center gap-1" style={{ color: sleepEndsAt ? accent : "#98989D" }}><Moon size={18} /><span className="text-[10px]">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
+                  <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); setShowVinylPanel(false); }} className="press flex flex-col items-center gap-1" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? accent : "#98989D" }}><SlidersHorizontal size={18} /><span className="text-[10px]">EQ</span></button>
+                  {vinylMode && <button onClick={() => { setShowVinylPanel((s) => !s); setShowEq(false); setShowSleep(false); }} className="press flex flex-col items-center gap-1" style={{ color: showVinylPanel ? accent : "#98989D" }}><Disc3 size={18} /><span className="text-[10px]">Vinyl</span></button>}
                   <button onClick={() => setNpView("queue")} className="press flex flex-col items-center gap-1" style={{ color: "#98989D" }}><ListMusic size={18} /><span className="text-[10px]">Up Next</span></button>
                 </div>
+
+                {showVinylPanel && vinylMode && (
+                  <div className="flex flex-col items-center gap-3 px-6 py-4 rounded-xl w-full max-w-xs fade-in" style={{ background: "rgba(28,28,30,0.9)" }}>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs tracking-widest" style={{ color: "#98989D" }}>SPEED</span>
+                      {[33, 45].map((r) => (
+                        <button key={r} onClick={() => setVinylRPM(r)} className="press px-3 py-1 rounded-full text-xs" style={{ background: vinylRPM === r ? accent : "rgba(255,255,255,0.1)", color: vinylRPM === r ? "#fff" : "#98989D" }}>{r} RPM</button>
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap justify-center">
+                      <button onClick={() => setCrackleEnabled((v) => !v)} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs" style={{ background: crackleEnabled ? accent : "rgba(255,255,255,0.1)", color: crackleEnabled ? "#fff" : "#98989D" }}><Waves size={14} />Crackle</button>
+                      <button onClick={() => setVinylShine((v) => !v)} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs" style={{ background: vinylShine ? accent : "rgba(255,255,255,0.1)", color: vinylShine ? "#fff" : "#98989D" }}><Sparkles size={14} />Shine</button>
+                      <button onClick={() => setVinylDust((v) => !v)} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs" style={{ background: vinylDust ? accent : "rgba(255,255,255,0.1)", color: vinylDust ? "#fff" : "#98989D" }}><Wind size={14} />Dust</button>
+                      <button onClick={() => setVinylReactive((v) => !v)} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs" style={{ background: vinylReactive ? accent : "rgba(255,255,255,0.1)", color: vinylReactive ? "#fff" : "#98989D" }}><Gauge size={14} />Pulse</button>
+                    </div>
+                    <span className="text-[10px] text-center" style={{ color: "#6E6E73" }}>Tip: grab the record and drag to scratch through the track</span>
+                  </div>
+                )}
 
                 {showEq && (
                   <div className="flex flex-col items-center gap-3 px-6 py-4 rounded-xl" style={{ background: "rgba(28,28,30,0.9)" }}>
