@@ -1598,31 +1598,33 @@ export default function MusicPlayer() {
         )}
       </main>
 
-      {currentTrack && !nowPlayingOpen && !selectMode && (
-        <div onClick={() => setNowPlayingOpen(true)} className={`glass press press-3d absolute left-2 right-2 flex items-center gap-3 px-3 rounded-2xl fade-in ${theme === "light" ? "glass-light" : ""}`} style={{ bottom: 66, height: 60, zIndex: 20, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)", boxShadow: "0 4px 14px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.18)" }}>
-          <ArtBox track={currentTrack} className="w-9 h-9 rounded-lg shrink-0" />
-          <div className="flex-1 min-w-0 text-left"><div className="text-sm font-medium truncate">{currentTrack.name}</div></div>
-          {isPlaying && <div className="flex items-end gap-0.5 h-4 shrink-0"><div className="eq-bar" style={{ animationDelay: "0s" }} /><div className="eq-bar" style={{ animationDelay: "0.2s" }} /><div className="eq-bar" style={{ animationDelay: "0.4s" }} /></div>}
-          <button onClick={(e) => { e.stopPropagation(); togglePlay(); }} className="press p-1.5 shrink-0">{isPlaying ? <Pause size={22} fill="#FFFFFF" /> : <Play size={22} fill="#FFFFFF" style={{ marginLeft: 2 }} />}</button>
-          <button onClick={(e) => { e.stopPropagation(); stepTrack(1); }} className="press p-1.5 shrink-0"><SkipForward size={20} fill="#FFFFFF" /></button>
-        </div>
-      )}
+      <div className="absolute left-0 right-0 bottom-0 flex flex-col" style={{ zIndex: 20 }}>
+        {currentTrack && !nowPlayingOpen && !selectMode && (
+          <div onClick={() => setNowPlayingOpen(true)} className={`glass press press-3d mx-2 mb-2 flex items-center gap-3 px-3 rounded-2xl fade-in shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 60, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)", boxShadow: "0 4px 14px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.18)" }}>
+            <ArtBox track={currentTrack} className="w-9 h-9 rounded-lg shrink-0" />
+            <div className="flex-1 min-w-0 text-left"><div className="text-sm font-medium truncate">{currentTrack.name}</div></div>
+            {isPlaying && <div className="flex items-end gap-0.5 h-4 shrink-0"><div className="eq-bar" style={{ animationDelay: "0s" }} /><div className="eq-bar" style={{ animationDelay: "0.2s" }} /><div className="eq-bar" style={{ animationDelay: "0.4s" }} /></div>}
+            <button onClick={(e) => { e.stopPropagation(); togglePlay(); }} className="press p-1.5 shrink-0">{isPlaying ? <Pause size={22} fill="#FFFFFF" /> : <Play size={22} fill="#FFFFFF" style={{ marginLeft: 2 }} />}</button>
+            <button onClick={(e) => { e.stopPropagation(); stepTrack(1); }} className="press p-1.5 shrink-0"><SkipForward size={20} fill="#FFFFFF" /></button>
+          </div>
+        )}
 
-      {selectMode && (
-        <div className={`glass absolute left-2 right-2 flex items-center gap-2 px-3 rounded-2xl fade-in ${theme === "light" ? "glass-light" : ""}`} style={{ bottom: 66, height: 60, zIndex: 20, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)" }}>
-          <button onClick={clearSelection} className="press p-2"><X size={20} /></button>
-          <span className="text-sm font-medium flex-1">{selectedIds.length} selected</span>
-          <button onClick={bulkPlay} disabled={!selectedIds.length} className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><Play size={20} fill="#fff" /></button>
-          <button onClick={() => setBulkAddSheetOpen(true)} disabled={!selectedIds.length} className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><ListPlus size={20} /></button>
-          <button onClick={bulkDelete} disabled={!selectedIds.length} className="press p-2" style={{ color: "#FF453A", opacity: selectedIds.length ? 1 : 0.35 }}><Trash2 size={20} /></button>
-        </div>
-      )}
+        {selectMode && (
+          <div className={`glass mx-2 mb-2 flex items-center gap-2 px-3 rounded-2xl fade-in shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 60, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)" }}>
+            <button onClick={clearSelection} className="press p-2"><X size={20} /></button>
+            <span className="text-sm font-medium flex-1">{selectedIds.length} selected</span>
+            <button onClick={bulkPlay} disabled={!selectedIds.length} className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><Play size={20} fill="#fff" /></button>
+            <button onClick={() => setBulkAddSheetOpen(true)} disabled={!selectedIds.length} className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><ListPlus size={20} /></button>
+            <button onClick={bulkDelete} disabled={!selectedIds.length} className="press p-2" style={{ color: "#FF453A", opacity: selectedIds.length ? 1 : 0.35 }}><Trash2 size={20} /></button>
+          </div>
+        )}
 
-      <nav className={`glass absolute left-0 right-0 bottom-0 flex items-stretch ${theme === "light" ? "glass-light" : ""}`} style={{ height: 66, zIndex: 21, border: "none", borderTop: `1px solid ${theme === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.1)"}`, boxShadow: "none" }}>
-        {[["home", "Home", <Home size={22} />], ["library", "Library", <LibraryIcon size={22} />], ["search", "Search", <Search size={22} />]].map(([key, label, icon]) => (
-          <button key={key} onClick={() => { setActiveTab(key); if (key !== "library") setOpenPlaylistId(null); clearSelection(); }} className="press flex-1 flex flex-col items-center justify-center gap-1" style={{ color: activeTab === key ? "#FA2D48" : "#98989D" }}>{icon}<span className="text-[10px] font-medium">{label}</span></button>
-        ))}
-      </nav>
+        <nav className={`glass flex items-stretch shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 66, border: "none", borderTop: `1px solid ${theme === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.1)"}`, boxShadow: "none" }}>
+          {[["home", "Home", <Home size={22} />], ["library", "Library", <LibraryIcon size={22} />], ["search", "Search", <Search size={22} />]].map(([key, label, icon]) => (
+            <button key={key} onClick={() => { setActiveTab(key); if (key !== "library") setOpenPlaylistId(null); clearSelection(); }} className="press flex-1 flex flex-col items-center justify-center gap-1" style={{ color: activeTab === key ? "#FA2D48" : "#98989D" }}>{icon}<span className="text-[10px] font-medium">{label}</span></button>
+          ))}
+        </nav>
+      </div>
 
       {nowPlayingOpen && currentTrack && (
         <div className="sheet-enter absolute inset-0 flex flex-col overflow-hidden" style={{ zIndex: 60, transform: `translateY(${dragY}px)`, transition: dragging ? "none" : `transform 0.3s ${SPRING}` }}>
