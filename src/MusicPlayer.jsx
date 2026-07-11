@@ -285,6 +285,267 @@ const EQ_PRESETS = {
 };
 
 // =====================================================================
+// Vinyl Mode — a dedicated "paper" turntable screen inspired by MD Vinyl:
+// a warm, tilted record bleeding off the frame, a real tonearm you can
+// drag onto the disc, and pill-shaped transport controls. All of the
+// original Vinyl Mode 2.0 features (RPM, shine, dust, reactive pulse,
+// crackle, scratch, color/backdrop swatches, EQ, sleep, speed) live on
+// in a compact light-themed control strip beneath the record.
+const PAPER_INK = "#1C1B17";
+const PAPER_SUB = "#8C8677";
+const PAPER_PILL = "#F8F5EE";
+const PAPER_PANEL = "rgba(28,27,23,0.05)";
+
+function PaperPill({ onClick, children, w = 46, h = 46, active }) {
+  return (
+    <button onClick={onClick} className="press flex items-center justify-center shrink-0" style={{
+      width: w, height: h, borderRadius: 999,
+      background: active ? PAPER_INK : PAPER_PILL,
+      boxShadow: "0 4px 12px rgba(28,27,23,0.14), inset 0 1px 0 rgba(255,255,255,0.7)",
+      border: "1px solid rgba(28,27,23,0.08)",
+    }}>{children}</button>
+  );
+}
+
+function VinylTurntableView(props) {
+  const {
+    currentTrack, isPlaying, currentTime, duration,
+    vinylColor, setVinylColor, vinylBackdrop, setVinylBackdrop,
+    vinylRPM, setVinylRPM, vinylShine, setVinylShine, vinylDust, setVinylDust, vinylReactive, setVinylReactive,
+    crackleEnabled, setCrackleEnabled,
+    armDragging, setArmDragging, armAngleOverride, setArmAngleOverride, armDragRef,
+    scratchDragging, scratchAngle, onDiscTouchStart, onDiscTouchMove, onDiscTouchEnd,
+    playNeedleClick, togglePlay, stepTrack,
+    shuffle, setShuffle, repeatMode, cycleRepeat, handleLoopTap, loopA, loopB,
+    showSleep, setShowSleep, sleepEndsAt, sleepRemaining, setSleepMinutes,
+    showEq, setShowEq, eqBands, setEqBands, eqPreset, setEqPreset,
+    showSpeed, setShowSpeed, playbackRate, setPlaybackRate,
+    showVinylPanel, setShowVinylPanel,
+    volume, muted, setMuted, onVolumeChange,
+    waveCanvasRef, waveWrapRef, onWaveClick,
+    vinylPulseRef, dustMotes, themeColor, accent, setNpView,
+  } = props;
+
+  const vc = VINYL_COLORS[vinylColor] || VINYL_COLORS.classic;
+  const progress = duration > 0 ? currentTime / duration : 0;
+  const restAngle = -18, engagedBase = 8, engagedEnd = 32;
+  const engagedAngle = engagedBase + progress * (engagedEnd - engagedBase);
+  const displayAngle = armDragging && armAngleOverride != null ? armAngleOverride : (isPlaying ? engagedAngle : restAngle);
+  const spinDuration = RPM_SPEEDS[vinylRPM] || RPM_SPEEDS[33];
+  const labelPathId = `vinylLabelPaper-${currentTrack.id}`;
+  const glowColor = themeColor ? `rgba(${themeColor.r},${themeColor.g},${themeColor.b},0.35)` : `hsla(${artHue(currentTrack.name)}, 60%, 55%, 0.35)`;
+
+  const onArmTouchStart = (e) => {
+    e.stopPropagation();
+    armDragRef.current = { startX: e.touches[0].clientX, baseline: isPlaying ? 1 : 0, engagement: isPlaying ? 1 : 0 };
+    setArmDragging(true);
+    playNeedleClick(isPlaying ? "up" : "down");
+  };
+  const onArmTouchMove = (e) => {
+    e.stopPropagation();
+    if (!armDragRef.current) return;
+    const dx = e.touches[0].clientX - armDragRef.current.startX;
+    const engagement = Math.max(0, Math.min(1, armDragRef.current.baseline + dx / 80));
+    armDragRef.current.engagement = engagement;
+    setArmAngleOverride(restAngle + engagement * (engagedAngle - restAngle));
+  };
+  const onArmTouchEnd = (e) => {
+    e.stopPropagation();
+    const engagement = armDragRef.current?.engagement ?? (isPlaying ? 1 : 0);
+    if (engagement > 0.5) { if (!isPlaying) togglePlay(); }
+    else { if (isPlaying) togglePlay(); }
+    armDragRef.current = null;
+    setArmDragging(false);
+    setArmAngleOverride(null);
+  };
+
+  return (
+    <div className="vinyl-player-body flex-1 flex flex-col overflow-y-auto" style={{ color: PAPER_INK }}>
+      {/* Turntable stage — tilted record bleeding off the frame */}
+      <div className="relative w-full shrink-0 overflow-hidden" style={{ height: "42vh", minHeight: 240, maxHeight: 360 }}>
+        <div className="absolute rounded-full" style={{ width: "70%", height: "70%", left: "52%", top: "56%", transform: "translate(-50%,-50%)", background: "radial-gradient(circle, rgba(28,27,23,0.22), transparent 70%)", filter: "blur(20px)" }} />
+
+        <div className="absolute" style={{ left: "50%", top: "50%", width: "130%", height: "130%", transform: "translate(-50%,-50%) rotate(-11deg)" }}>
+          <div ref={vinylPulseRef} className="absolute rounded-full pointer-events-none" style={{ width: "56%", height: "56%", left: "5%", top: "17%", background: `radial-gradient(circle, ${glowColor}, transparent 72%)`, opacity: 0, filter: "blur(20px)", transition: "opacity 0.15s linear" }} />
+
+          <div
+            onTouchStart={onDiscTouchStart} onTouchMove={onDiscTouchMove} onTouchEnd={onDiscTouchEnd}
+            className="absolute rounded-full"
+            style={{
+              width: "62%", height: "62%", left: "4%", top: "16%",
+              background: `repeating-radial-gradient(circle, ${vc.base} 0px, ${vc.base} 2px, ${vc.groove} 3px, ${vc.base} 4px)`,
+              animation: !scratchDragging && isPlaying ? `spin ${spinDuration}s linear infinite` : "none",
+              transform: scratchDragging ? `rotate(${scratchAngle}deg)` : undefined,
+              boxShadow: "0 22px 48px rgba(28,27,23,0.35)",
+              cursor: "grab", touchAction: "none",
+            }}
+          >
+            <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full" style={{ pointerEvents: "none" }}>
+              <defs><path id={labelPathId} d="M 50,50 m -33,0 a 33,33 0 1,1 66,0 a 33,33 0 1,1 -66,0" /></defs>
+              <text fill="rgba(255,255,255,0.30)" fontSize="3.1" letterSpacing="2">
+                <textPath href={`#${labelPathId}`} startOffset="0%">{(currentTrack.name || "SPOOL").toUpperCase()} • SPOOL VINYL •{" "}</textPath>
+              </text>
+            </svg>
+            <div className="absolute rounded-full overflow-hidden" style={{ width: "38%", height: "38%", top: "31%", left: "31%", boxShadow: `0 0 0 3px #0a0a0a, 0 0 0 4px ${vc.groove}` }}>
+              <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">{!currentTrack.artUrl && <Disc3 size={26} color="rgba(255,255,255,0.5)" />}</ArtBox>
+            </div>
+            <div className="absolute rounded-full" style={{ width: 9, height: 9, top: "50%", left: "50%", transform: "translate(-50%,-50%)", background: "#0a0a0a" }} />
+            {vinylShine && (
+              <div className="absolute inset-0 rounded-full pointer-events-none" style={{ background: "conic-gradient(from 0deg, transparent 0%, rgba(255,255,255,0.22) 6%, transparent 16%, transparent 82%, rgba(255,255,255,0.10) 92%, transparent 100%)", animation: "vinylShine 7s linear infinite", mixBlendMode: "screen" }} />
+            )}
+          </div>
+
+          {vinylDust && (
+            <div className="absolute inset-0 pointer-events-none">
+              {dustMotes.slice(0, 14).map((d) => (
+                <div key={d.id} style={{ position: "absolute", left: `${d.left}%`, top: `${d.top}%`, width: d.size, height: d.size, borderRadius: "50%", background: "rgba(28,27,23,0.16)", animation: `dustFloat ${d.dur}s ease-in-out ${d.delay}s infinite`, "--drift": `${d.drift}px` }} />
+              ))}
+            </div>
+          )}
+
+          {/* Tonearm assembly — pivot capsule, chrome rod, headshell */}
+          <div className="absolute" style={{ top: "-2%", right: "2%", width: "40%", height: "58%", transformOrigin: "78% 14%", transform: `rotate(${displayAngle}deg)`, transition: armDragging ? "none" : `transform 0.4s ${SPRING}`, zIndex: 6 }}>
+            <div style={{ position: "absolute", top: "0%", right: "4%", width: 46, height: 62, borderRadius: "46% 46% 50% 50% / 40% 40% 60% 60%", background: "linear-gradient(160deg, #ffffff, #dcd6c8 70%)", boxShadow: "0 6px 14px rgba(0,0,0,0.28), inset 0 2px 3px rgba(255,255,255,0.8)", border: "1px solid rgba(0,0,0,0.06)" }} />
+            <div style={{ position: "absolute", top: "6%", right: "13%", width: 16, height: 16, borderRadius: "50%", background: "linear-gradient(160deg,#fff,#cfc9bb)", boxShadow: "0 2px 4px rgba(0,0,0,0.3)" }} />
+            <div style={{ position: "absolute", top: "16%", right: "20%", width: 4, height: "68%", background: "linear-gradient(#e8e8ea, #a9a9ad 40%, #8c8c90)", borderRadius: 3, boxShadow: "1px 0 2px rgba(0,0,0,0.25)" }} />
+            <div style={{ position: "absolute", bottom: "2%", left: "0%", width: 26, height: 15, borderRadius: 4, background: "linear-gradient(160deg,#fdfcf8,#e2ddd0)", boxShadow: "0 3px 6px rgba(0,0,0,0.3)", transform: "rotate(-6deg)" }} />
+            <div
+              onTouchStart={onArmTouchStart} onTouchMove={onArmTouchMove} onTouchEnd={onArmTouchEnd} onClick={(e) => e.stopPropagation()}
+              style={{ position: "absolute", bottom: "-2%", left: "-4%", width: 24, height: 24, borderRadius: "50%", cursor: "grab" }}
+            />
+          </div>
+        </div>
+
+        {/* Quick color + backdrop swatches, bottom of stage */}
+        <div className="vinyl-swatch-row absolute left-0 right-0 flex items-center justify-center gap-1.5 overflow-x-auto px-3" style={{ bottom: 6, scrollbarWidth: "none" }}>
+          {Object.entries(VINYL_COLORS).map(([key, v]) => (
+            <button key={key} onClick={(e) => { e.stopPropagation(); setVinylColor(key); }} className="press rounded-full shrink-0" style={{ width: 14, height: 14, background: v.swatch, border: vinylColor === key ? `2px solid ${PAPER_INK}` : "2px solid rgba(28,27,23,0.15)" }} />
+          ))}
+          <span style={{ width: 1, height: 12, background: "rgba(28,27,23,0.18)", margin: "0 2px", flexShrink: 0 }} />
+          {Object.entries(VINYL_BACKDROPS).map(([key, v]) => (
+            <button key={key} onClick={(e) => { e.stopPropagation(); setVinylBackdrop(key); }} className="press rounded-full shrink-0" style={{ width: 14, height: 14, background: v.css, border: vinylBackdrop === key ? `2px solid ${PAPER_INK}` : "2px solid rgba(28,27,23,0.15)" }} />
+          ))}
+        </div>
+
+        <style>{`
+          @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+          @keyframes vinylShine { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+          @keyframes dustFloat { 0%, 100% { transform: translate(0, 0); opacity: 0.12; } 50% { transform: translate(var(--drift), -16px); opacity: 0.6; } }
+          .vinyl-swatch-row::-webkit-scrollbar { display: none; }
+        `}</style>
+      </div>
+
+      {/* Track info */}
+      <div className="px-7 pt-3">
+        <div className="text-[21px] leading-tight font-extrabold truncate">{currentTrack.name}</div>
+        <div className="text-sm mt-1 font-medium" style={{ color: PAPER_SUB }}>Spool</div>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 8 }} />
+
+      {/* Waveform scrubber */}
+      <div className="px-7 flex items-center gap-3">
+        <span className="text-[11px] w-8 text-right" style={{ color: PAPER_SUB }}>{fmtTime(currentTime)}</span>
+        <div ref={waveWrapRef} className="flex-1 h-8 rounded-lg overflow-hidden" style={{ background: PAPER_PANEL }}><canvas ref={waveCanvasRef} height={32} onClick={onWaveClick} className="w-full h-full" /></div>
+        <span className="text-[11px] w-8" style={{ color: PAPER_SUB }}>{fmtTime(duration)}</span>
+      </div>
+
+      {/* Pill transport row, MD-Vinyl style */}
+      <div className="px-7 pt-5 flex items-end justify-between gap-4">
+        <div className="flex flex-col items-center gap-2">
+          <PaperPill onClick={togglePlay} w={112} h={48}>
+            {isPlaying ? <Pause size={19} color={PAPER_INK} fill={PAPER_INK} /> : <Play size={19} color={PAPER_INK} fill={PAPER_INK} style={{ marginLeft: 2 }} />}
+          </PaperPill>
+          <span className="text-[10px] tracking-widest font-bold" style={{ color: PAPER_SUB }}>{isPlaying ? "PAUSE" : "PLAY"}</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="flex flex-col items-center gap-2">
+            <PaperPill onClick={() => stepTrack(-1)}><SkipBack size={17} color={PAPER_INK} fill={PAPER_INK} /></PaperPill>
+          </div>
+          <div className="flex flex-col items-center gap-2">
+            <PaperPill onClick={() => stepTrack(1)}><SkipForward size={17} color={PAPER_INK} fill={PAPER_INK} /></PaperPill>
+          </div>
+        </div>
+      </div>
+
+      {/* Volume */}
+      <div className="px-7 pt-5 flex items-center gap-3">
+        <button onClick={() => setMuted((m) => !m)} className="press p-1" style={{ color: PAPER_SUB }}>{muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}</button>
+        <input type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} onChange={onVolumeChange} className="flex-1" />
+      </div>
+
+      {/* Compact feature strip — all the original features, restyled */}
+      <div className="px-7 pt-4 pb-2 flex items-center gap-5 overflow-x-auto vinyl-swatch-row" style={{ scrollbarWidth: "none" }}>
+        <button onClick={() => setShuffle((s) => !s)} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: shuffle ? accent : PAPER_SUB }}><Shuffle size={17} /><span className="text-[9px] font-semibold">Shuffle</span></button>
+        <button onClick={cycleRepeat} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: repeatMode !== "off" ? accent : PAPER_SUB }}>{repeatMode === "one" ? <Repeat1 size={17} /> : <Repeat size={17} />}<span className="text-[9px] font-semibold">Repeat</span></button>
+        <button onClick={handleLoopTap} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: loopA != null ? accent : PAPER_SUB }}><Gauge size={17} /><span className="text-[9px] font-semibold">{loopB != null ? "Looping" : loopA != null ? "Set End" : "A-B Loop"}</span></button>
+        <button onClick={() => setNpView("lyrics")} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: PAPER_SUB }}><Mic2 size={17} /><span className="text-[9px] font-semibold">Lyrics</span></button>
+        <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); setShowVinylPanel(false); setShowSpeed(false); }} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: sleepEndsAt ? accent : PAPER_SUB }}><Moon size={17} /><span className="text-[9px] font-semibold">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
+        <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); setShowVinylPanel(false); setShowSpeed(false); }} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? accent : PAPER_SUB }}><SlidersHorizontal size={17} /><span className="text-[9px] font-semibold">EQ</span></button>
+        <button onClick={() => { setShowSpeed((s) => !s); setShowEq(false); setShowSleep(false); setShowVinylPanel(false); }} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: showSpeed || playbackRate !== 1 ? accent : PAPER_SUB }}><Gauge size={17} /><span className="text-[9px] font-semibold">{playbackRate}x</span></button>
+        <button onClick={() => { setShowVinylPanel((s) => !s); setShowEq(false); setShowSleep(false); setShowSpeed(false); }} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: showVinylPanel ? accent : PAPER_SUB }}><Disc3 size={17} /><span className="text-[9px] font-semibold">Turntable</span></button>
+        <button onClick={() => setNpView("queue")} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: PAPER_SUB }}><ListMusic size={17} /><span className="text-[9px] font-semibold">Up Next</span></button>
+      </div>
+
+      {showVinylPanel && (
+        <div className="mx-7 mb-3 flex flex-col gap-3 px-5 py-4 rounded-2xl fade-in" style={{ background: PAPER_PANEL, border: "1px solid rgba(28,27,23,0.08)" }}>
+          <div className="flex items-center gap-2">
+            <span className="text-xs tracking-widest font-semibold" style={{ color: PAPER_SUB }}>SPEED</span>
+            {[33, 45].map((r) => (
+              <button key={r} onClick={() => setVinylRPM(r)} className="press px-3 py-1 rounded-full text-xs" style={{ background: vinylRPM === r ? PAPER_INK : "rgba(28,27,23,0.06)", color: vinylRPM === r ? "#fff" : PAPER_SUB }}>{r} RPM</button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <button onClick={() => setCrackleEnabled((v) => !v)} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs" style={{ background: crackleEnabled ? PAPER_INK : "rgba(28,27,23,0.06)", color: crackleEnabled ? "#fff" : PAPER_SUB }}><Waves size={14} />Crackle</button>
+            <button onClick={() => setVinylShine((v) => !v)} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs" style={{ background: vinylShine ? PAPER_INK : "rgba(28,27,23,0.06)", color: vinylShine ? "#fff" : PAPER_SUB }}><Sparkles size={14} />Shine</button>
+            <button onClick={() => setVinylDust((v) => !v)} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs" style={{ background: vinylDust ? PAPER_INK : "rgba(28,27,23,0.06)", color: vinylDust ? "#fff" : PAPER_SUB }}><Wind size={14} />Dust</button>
+            <button onClick={() => setVinylReactive((v) => !v)} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs" style={{ background: vinylReactive ? PAPER_INK : "rgba(28,27,23,0.06)", color: vinylReactive ? "#fff" : PAPER_SUB }}><Gauge size={14} />Pulse</button>
+          </div>
+          <span className="text-[10px] text-center" style={{ color: PAPER_SUB }}>Tip: drag the tonearm onto the record, or grab the disc itself to scratch</span>
+        </div>
+      )}
+
+      {showSpeed && (
+        <div className="mx-7 mb-3 flex flex-col items-center gap-3 px-5 py-4 rounded-2xl fade-in" style={{ background: PAPER_PANEL, border: "1px solid rgba(28,27,23,0.08)" }}>
+          <span className="text-xs tracking-widest font-semibold" style={{ color: PAPER_SUB }}>PLAYBACK SPEED</span>
+          <div className="flex items-center gap-2 flex-wrap justify-center">
+            {[0.75, 1, 1.25, 1.5, 1.75, 2].map((r) => (
+              <button key={r} onClick={() => setPlaybackRate(r)} className="press px-3 py-1.5 rounded-full text-xs font-medium" style={{ background: playbackRate === r ? PAPER_INK : "rgba(28,27,23,0.06)", color: playbackRate === r ? "#fff" : PAPER_SUB }}>{r}x</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showEq && (
+        <div className="mx-7 mb-3 flex flex-col items-center gap-3 px-5 py-4 rounded-2xl fade-in" style={{ background: PAPER_PANEL, border: "1px solid rgba(28,27,23,0.08)" }}>
+          <div className="flex gap-2">
+            {Object.keys(EQ_PRESETS).map((name) => (
+              <button key={name} onClick={() => { setEqBands(EQ_PRESETS[name]); setEqPreset(name); }} className="press px-3 py-1 rounded-full text-xs" style={{ background: eqPreset === name ? PAPER_INK : "rgba(28,27,23,0.06)", color: eqPreset === name ? "#fff" : PAPER_SUB }}>{name}</button>
+            ))}
+          </div>
+          <div className="flex items-end gap-6 pt-1">
+            {[["bass", "BASS"], ["mid", "MID"], ["treble", "TREB"]].map(([key, label]) => (
+              <div key={key} className="flex flex-col items-center gap-2">
+                <span className="text-xs font-semibold" style={{ color: PAPER_INK }}>{eqBands[key] > 0 ? `+${eqBands[key]}` : eqBands[key]}</span>
+                <input type="range" className="vert" min={-12} max={12} step={1} value={eqBands[key]} onChange={(e) => { setEqBands((b) => ({ ...b, [key]: Number(e.target.value) })); setEqPreset("Custom"); }} />
+                <span className="text-xs tracking-widest" style={{ color: PAPER_SUB }}>{label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showSleep && (
+        <div className="mx-7 mb-3 rounded-2xl py-1 fade-in" style={{ background: PAPER_PANEL, border: "1px solid rgba(28,27,23,0.08)" }}>
+          {[15, 30, 45, 60].map((m) => (<button key={m} onClick={() => setSleepMinutes(m)} className="block w-full text-left px-4 py-2 text-xs" style={{ color: PAPER_INK }}>{m} minutes</button>))}
+          <button onClick={() => setSleepMinutes(0)} className="block w-full text-left px-4 py-2 text-xs" style={{ color: "#B5402E" }}>Turn off</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// =====================================================================
 export default function MusicPlayer() {
   const [loaded, setLoaded] = useState(false);
   const [library, setLibrary] = useState([]);
@@ -1626,27 +1887,52 @@ export default function MusicPlayer() {
         </nav>
       </div>
 
-      {nowPlayingOpen && currentTrack && (
+      {nowPlayingOpen && currentTrack && (() => {
+        const paperMode = vinylMode && npView === "player";
+        const PAPER_BG = "#EDE7DC";
+        return (
         <div className="sheet-enter absolute inset-0 flex flex-col overflow-hidden" style={{ zIndex: 60, transform: `translateY(${dragY}px)`, transition: dragging ? "none" : `transform 0.3s ${SPRING}` }}>
-          <div className="absolute inset-0" style={{ background: "#0A0A0A" }} />
-          <div ref={bgGlowRef} className="absolute" style={{ top: "-20%", left: "-20%", width: "140%", height: "70%", background: themeColor ? `radial-gradient(circle, rgb(${themeColor.r},${themeColor.g},${themeColor.b}), transparent 70%)` : artGradient(currentTrack.name), filter: "blur(90px)", opacity: 0.55, transition: "transform 0.08s linear, opacity 0.08s linear" }} />
-          <div className="absolute inset-0" style={{ background: "linear-gradient(180deg, transparent, rgba(0,0,0,0.6) 55%, #0A0A0A 90%)" }} />
+          <div className="absolute inset-0" style={{ background: paperMode ? PAPER_BG : "#0A0A0A", transition: "background 0.4s ease" }} />
+          <div ref={bgGlowRef} className="absolute" style={{ top: "-20%", left: "-20%", width: "140%", height: "70%", background: themeColor ? `radial-gradient(circle, rgb(${themeColor.r},${themeColor.g},${themeColor.b}), transparent 70%)` : artGradient(currentTrack.name), filter: "blur(90px)", opacity: paperMode ? 0 : 0.55, transition: "transform 0.08s linear, opacity 0.3s linear" }} />
+          <div className="absolute inset-0" style={{ background: paperMode ? "transparent" : "linear-gradient(180deg, transparent, rgba(0,0,0,0.6) 55%, #0A0A0A 90%)" }} />
 
           <div className="relative flex flex-col h-full" onTouchStart={onSheetTouchStart} onTouchMove={onSheetTouchMove} onTouchEnd={onSheetTouchEnd}>
-            <div className="flex flex-col items-center pt-2 pb-1 shrink-0"><div className="w-9 h-1 rounded-full" style={{ background: "rgba(255,255,255,0.35)" }} /></div>
-            <div className="flex items-center justify-between px-5 shrink-0" style={{ height: 44 }}>
-              <button onClick={() => setNowPlayingOpen(false)} className="press p-1"><ChevronDown size={22} /></button>
-              <div className="text-center"><div className="text-[10px] tracking-wider" style={{ color: "#98989D" }}>PLAYING FROM</div><div className="text-xs font-semibold">{queueSource}</div></div>
+            <div className="flex flex-col items-center pt-2 pb-1 shrink-0"><div className="w-9 h-1 rounded-full" style={{ background: paperMode ? "rgba(28,27,23,0.22)" : "rgba(255,255,255,0.35)" }} /></div>
+            <div className="flex items-center justify-between px-5 shrink-0" style={{ height: 44, color: paperMode ? "#1C1B17" : "#FFFFFF" }}>
+              <button onClick={() => setNowPlayingOpen(false)} className="press p-1"><ChevronDown size={22} color={paperMode ? "#1C1B17" : "#FFFFFF"} /></button>
+              <div className="text-center"><div className="text-[10px] tracking-wider" style={{ color: paperMode ? "#8C8677" : "#98989D" }}>PLAYING FROM</div><div className="text-xs font-semibold">{queueSource}</div></div>
               <div className="flex items-center gap-3">
-                <button onClick={() => setVinylMode((v) => !v)} className="press p-1"><Disc3 size={19} color={vinylMode ? accent : "#FFFFFF"} /></button>
-                {vinylMode && <button onClick={() => setCrackleEnabled((c) => !c)} className="press p-1" title="Vinyl crackle"><Waves size={18} color={crackleEnabled ? accent : "#FFFFFF"} /></button>}
-                <button onClick={startFloatingPlayer} className="press p-1"><PictureInPicture2 size={17} /></button>
-                <button onClick={() => toggleLike(currentTrack.id)} className="press p-1"><Heart size={19} color={likedIds.includes(currentTrack.id) ? accent : "#FFFFFF"} fill={likedIds.includes(currentTrack.id) ? accent : "none"} /></button>
-                <button onClick={() => setInfoSheetTrackId(currentTrack.id)} className="press p-1"><Info size={19} /></button>
+                <button onClick={() => setVinylMode((v) => !v)} className="press p-1"><Disc3 size={19} color={vinylMode ? accent : paperMode ? "#1C1B17" : "#FFFFFF"} /></button>
+                {vinylMode && <button onClick={() => setCrackleEnabled((c) => !c)} className="press p-1" title="Vinyl crackle"><Waves size={18} color={crackleEnabled ? accent : paperMode ? "#1C1B17" : "#FFFFFF"} /></button>}
+                <button onClick={startFloatingPlayer} className="press p-1"><PictureInPicture2 size={17} color={paperMode ? "#1C1B17" : "#FFFFFF"} /></button>
+                <button onClick={() => toggleLike(currentTrack.id)} className="press p-1"><Heart size={19} color={likedIds.includes(currentTrack.id) ? accent : (paperMode ? "#1C1B17" : "#FFFFFF")} fill={likedIds.includes(currentTrack.id) ? accent : "none"} /></button>
+                <button onClick={() => setInfoSheetTrackId(currentTrack.id)} className="press p-1"><Info size={19} color={paperMode ? "#1C1B17" : "#FFFFFF"} /></button>
               </div>
             </div>
 
-            {npView === "player" && (
+            {npView === "player" && (vinylMode ? (
+              <VinylTurntableView
+                currentTrack={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={duration}
+                vinylColor={vinylColor} setVinylColor={setVinylColor} vinylBackdrop={vinylBackdrop} setVinylBackdrop={setVinylBackdrop}
+                vinylRPM={vinylRPM} setVinylRPM={setVinylRPM} vinylShine={vinylShine} setVinylShine={setVinylShine}
+                vinylDust={vinylDust} setVinylDust={setVinylDust} vinylReactive={vinylReactive} setVinylReactive={setVinylReactive}
+                crackleEnabled={crackleEnabled} setCrackleEnabled={setCrackleEnabled}
+                armDragging={armDragging} setArmDragging={setArmDragging} armAngleOverride={armAngleOverride} setArmAngleOverride={setArmAngleOverride}
+                armDragRef={armDragRef} scratchDragging={scratchDragging} scratchAngle={scratchAngle}
+                onDiscTouchStart={onDiscTouchStart} onDiscTouchMove={onDiscTouchMove} onDiscTouchEnd={onDiscTouchEnd}
+                playNeedleClick={playNeedleClick} togglePlay={togglePlay} stepTrack={stepTrack}
+                shuffle={shuffle} setShuffle={setShuffle} repeatMode={repeatMode} cycleRepeat={cycleRepeat}
+                handleLoopTap={handleLoopTap} loopA={loopA} loopB={loopB}
+                showSleep={showSleep} setShowSleep={setShowSleep} sleepEndsAt={sleepEndsAt} sleepRemaining={sleepRemaining} setSleepMinutes={setSleepMinutes}
+                showEq={showEq} setShowEq={setShowEq} eqBands={eqBands} setEqBands={setEqBands} eqPreset={eqPreset} setEqPreset={setEqPreset}
+                showSpeed={showSpeed} setShowSpeed={setShowSpeed} playbackRate={playbackRate} setPlaybackRate={setPlaybackRate}
+                showVinylPanel={showVinylPanel} setShowVinylPanel={setShowVinylPanel}
+                volume={volume} muted={muted} setMuted={setMuted} onVolumeChange={onVolumeChange}
+                waveCanvasRef={waveCanvasRef} waveWrapRef={waveWrapRef} onWaveClick={onWaveClick}
+                vinylPulseRef={vinylPulseRef} dustMotes={dustMotes} themeColor={themeColor} accent={accent}
+                setNpView={setNpView}
+              />
+            ) : (
               <div className="np-player-body flex-1 flex flex-col items-center justify-center px-8 gap-6 overflow-y-auto">
                 <div className="np-art w-full max-w-xs aspect-square rounded-2xl overflow-hidden shadow-2xl" onTouchStart={vinylMode ? undefined : onArtTouchStart} onTouchMove={vinylMode ? undefined : onArtTouchMove} onTouchEnd={vinylMode ? undefined : onArtTouchEnd}
                   style={{ transform: `translateX(${artSwipeX}px)`, transition: artSwipeX === 0 ? `transform 0.25s ${SPRING}` : "none" }}>
@@ -1882,7 +2168,7 @@ export default function MusicPlayer() {
                 )}
               </div>
               </div>
-            )}
+            ))}
 
             {npView === "queue" && (
               <div className="flex-1 overflow-y-auto px-2">
@@ -1910,7 +2196,8 @@ export default function MusicPlayer() {
             {npView === "lyrics" && <LyricsPanel track={currentTrack} text={lyricsMap[currentTrack.id] || ""} onSave={(text) => setLyricsMap((prev) => ({ ...prev, [currentTrack.id]: text }))} onBack={() => setNpView("player")} />}
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {contextTrackId && (
         <BottomSheetBackdrop bg={sheetBg} onClose={closeContext}>
