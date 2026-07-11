@@ -1056,26 +1056,12 @@ export default function MusicPlayer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nowPlayingOpen, contextTrackId, addSheetTrackId, infoSheetTrackId, newPlaylistSheet, bulkAddSheetOpen, showStats, showSettings, tagSheetTrackId, renameTrackId]);
 
-  // WOW — dynamic status bar / PWA chrome color that hints at the playing
-  // track's color without ever looking off — blended heavily toward black
-  // so it always stays dark and cohesive with the rest of the app.
+  // Status bar / PWA chrome color always matches the app's real background
+  // so there's never a visible seam between the OS status bar and the UI.
   useEffect(() => {
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (!meta) return;
-    if (!currentTrack) { meta.setAttribute("content", palette.bg); return; }
-    let statusColor = palette.bg;
-    const rgbMatch = accent.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
-    const hslMatch = accent.match(/hsl\((\d+)\s+(\d+)%\s+(\d+)%\)/);
-    if (rgbMatch) {
-      const r = Math.round(parseInt(rgbMatch[1]) * 0.22);
-      const g = Math.round(parseInt(rgbMatch[2]) * 0.22);
-      const b = Math.round(parseInt(rgbMatch[3]) * 0.22);
-      statusColor = `rgb(${r},${g},${b})`;
-    } else if (hslMatch) {
-      statusColor = `hsl(${hslMatch[1]} 40% 12%)`;
-    }
-    meta.setAttribute("content", statusColor);
-  }, [accent, currentTrack, palette.bg]);
+    if (meta) meta.setAttribute("content", palette.bg);
+  }, [palette.bg]);
 
   const setSleepMinutes = (mins) => {
     clearTimeout(sleepTimeoutRef.current); clearTimeout(sleepFadeTimeoutRef.current);
@@ -1361,18 +1347,28 @@ export default function MusicPlayer() {
   const openContext = (trackId, mode, playlistId = null) => { setContextTrackId(trackId); setContextInfo({ mode, playlistId }); };
   const closeContext = () => { setContextTrackId(null); setContextInfo(null); };
 
+  // WOW — Spotify-style quick access grid: shuffle, liked songs, and your
+  // playlists as tappable shortcut tiles at the top of Home.
+  const quickAccessItems = [
+    { key: "shuffle", label: `Shuffle All`, icon: <Shuffle size={20} color={accent} />, onClick: shuffleAll },
+    ...(likedTracks.length ? [{ key: "liked", label: "Liked Songs", icon: <Heart size={20} color={accent} fill={accent} />, onClick: () => playFrom(likedTracks, 0, "Favorites") }] : []),
+    ...playlists.slice(0, 5).map((p) => ({ key: p.id, label: p.name, icon: <ListMusic size={18} color={accent} />, onClick: () => { setActiveTab("library"); setOpenPlaylistId(p.id); } })),
+  ].slice(0, 6);
+
   // ==================================================================
   return (
-    <div className="fixed inset-0 flex flex-col overflow-hidden select-none" style={{ background: palette.bg, color: palette.text, fontFamily: "-apple-system, BlinkMacSystemFont, 'Inter', sans-serif" }}>
+    <div className="app-shell fixed inset-0 flex flex-col overflow-hidden select-none" style={{ background: palette.bg, color: palette.text, fontFamily: "-apple-system, BlinkMacSystemFont, 'Inter', sans-serif" }}>
       <style>{`
+        .app-shell { height: 100vh; }
+        @supports (height: 100dvh) { .app-shell { height: 100dvh; } }
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
         input[type="range"] { -webkit-appearance:none; appearance:none; height:4px; background:rgba(255,255,255,0.2); border-radius:999px; outline:none; }
         input[type="range"]::-webkit-slider-thumb { -webkit-appearance:none; appearance:none; width:16px; height:16px; border-radius:50%; background:#FFFFFF; cursor:pointer; }
         input[type="range"]::-moz-range-thumb { width:16px; height:16px; border-radius:50%; background:#FFFFFF; cursor:pointer; border:none; }
         input[type="range"].vert { writing-mode: vertical-lr; direction: rtl; width:4px; height:90px; }
         ::-webkit-scrollbar { display: none; }
-        .press:active { transform: scale(0.93) translateY(0.5px); filter: brightness(0.94); }
-        .press { transition: transform 0.15s ${SPRING}, filter 0.15s; }
+        .press:active { transform: scale(0.93) translateY(1px); filter: brightness(0.94); box-shadow: 0 2px 6px rgba(0,0,0,0.3); }
+        .press { transition: transform 0.15s ${SPRING}, filter 0.15s, box-shadow 0.15s; transform-style: preserve-3d; }
         .sheet-enter { animation: slideUp 0.28s ${SPRING}; }
         @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
         .eq-bar { width: 3px; background: #FA2D48; border-radius: 2px; animation: eqPulse 0.9s ease-in-out infinite; box-shadow: 0 0 4px rgba(250,45,72,0.7); }
@@ -1440,7 +1436,7 @@ export default function MusicPlayer() {
           <div className="flex items-center gap-2">
             {activeTab === "home" && (
               <>
-                <button onClick={() => setShowStats(true)} className="press p-2 rounded-full" style={{ background: palette.surface }}><TrendingUp size={16} /></button>
+                <button onClick={() => setShowStats(true)} className="glass-pill press press-3d p-2 rounded-full" style={{ background: palette.surface }}><TrendingUp size={16} /></button>
                 <button onClick={() => { setShowSettings(true); refreshStorageEstimate(); }} className="glass-pill press press-3d p-2 rounded-full" style={{ background: palette.surface }}><Settings size={16} /></button>
               </>
             )}
@@ -1465,9 +1461,11 @@ export default function MusicPlayer() {
               <EmptyState dragOver={dragOver} message="Import some tracks to get started. Drag files anywhere, or tap the upload icon above." />
             ) : (
               <>
-                <button onClick={shuffleAll} className="press glass-pill press-3d w-full flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-semibold" style={{ color: palette.text }}>
-                  <Shuffle size={16} color={accent} /> Shuffle All ({library.length} songs)
-                </button>
+                <div className="grid grid-cols-2 gap-2.5">
+                  {quickAccessItems.map((item) => (
+                    <QuickTile key={item.key} label={item.label} icon={item.icon} onClick={item.onClick} palette={palette} theme={theme} />
+                  ))}
+                </div>
                 <HomeRow title="Recently Added" tracks={recentlyAdded} onPlay={(i) => playFrom(recentlyAdded, i, "Recently Added")} />
                 {likedTracks.length > 0 && <HomeRow title="Favorites" icon={<Heart size={14} />} tracks={likedTracks} onPlay={(i) => playFrom(likedTracks, i, "Favorites")} />}
                 {recentlyPlayedTracks.length > 0 && <HomeRow title="Recently Played" icon={<Clock size={14} />} tracks={recentlyPlayedTracks} onPlay={(i) => playFrom(recentlyPlayedTracks, i, "Recently Played")} />}
@@ -1574,10 +1572,10 @@ export default function MusicPlayer() {
 
         {activeTab === "search" && (
           <div className="pt-1">
-            <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl mb-4" style={{ background: palette.surface }}>
+            <div className={`glass-pill flex items-center gap-2 px-3 py-2.5 rounded-xl mb-4 ${theme === "light" ? "glass-light" : ""}`} style={{ background: palette.surface }}>
               <Search size={15} color={palette.subtext} />
               <input autoFocus value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Artists, Songs, Playlists" className="bg-transparent outline-none text-sm flex-1" style={{ color: palette.text }} />
-              {searchQuery && <button onClick={() => setSearchQuery("")}><X size={15} color={palette.subtext} /></button>}
+              {searchQuery && <button onClick={() => setSearchQuery("")} className="press p-1"><X size={15} color={palette.subtext} /></button>}
             </div>
             {!q ? (<div className="text-sm text-center py-16" style={{ color: palette.subtext }}>Search your library and playlists</div>) : (
               <>
@@ -1813,7 +1811,7 @@ export default function MusicPlayer() {
                 <canvas ref={vuCanvasRef} width={140} height={26} />
 
                 <div className="w-full flex items-center gap-4">
-                  <button onClick={() => setMuted((m) => !m)} style={{ color: "#98989D" }}>{muted || volume === 0 ? <VolumeX size={16} /> : <Volume2 size={16} />}</button>
+                  <button onClick={() => setMuted((m) => !m)} className="press p-1" style={{ color: "#98989D" }}>{muted || volume === 0 ? <VolumeX size={16} /> : <Volume2 size={16} />}</button>
                   <input type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} onChange={onVolumeChange} className="flex-1" />
                 </div>
 
@@ -1828,7 +1826,7 @@ export default function MusicPlayer() {
                 </div>
 
                 {showSpeed && (
-                  <div className="flex flex-col items-center gap-3 px-6 py-4 rounded-xl w-full max-w-xs fade-in" style={{ background: "rgba(28,28,30,0.9)" }}>
+                  <div className="glass flex flex-col items-center gap-3 px-6 py-4 rounded-xl w-full max-w-xs fade-in" style={{ background: "rgba(28,28,30,0.55)" }}>
                     <span className="text-xs tracking-widest" style={{ color: "#98989D" }}>PLAYBACK SPEED</span>
                     <div className="flex items-center gap-2 flex-wrap justify-center">
                       {[0.75, 1, 1.25, 1.5, 1.75, 2].map((r) => (
@@ -1839,7 +1837,7 @@ export default function MusicPlayer() {
                 )}
 
                 {showVinylPanel && vinylMode && (
-                  <div className="flex flex-col items-center gap-3 px-6 py-4 rounded-xl w-full max-w-xs fade-in" style={{ background: "rgba(28,28,30,0.9)" }}>
+                  <div className="glass flex flex-col items-center gap-3 px-6 py-4 rounded-xl w-full max-w-xs fade-in" style={{ background: "rgba(28,28,30,0.55)" }}>
                     <div className="flex items-center gap-2">
                       <span className="text-xs tracking-widest" style={{ color: "#98989D" }}>SPEED</span>
                       {[33, 45].map((r) => (
@@ -1857,7 +1855,7 @@ export default function MusicPlayer() {
                 )}
 
                 {showEq && (
-                  <div className="flex flex-col items-center gap-3 px-6 py-4 rounded-xl" style={{ background: "rgba(28,28,30,0.9)" }}>
+                  <div className="glass flex flex-col items-center gap-3 px-6 py-4 rounded-xl" style={{ background: "rgba(28,28,30,0.55)" }}>
                     <div className="flex gap-2">
                       {Object.keys(EQ_PRESETS).map((name) => (
                         <button key={name} onClick={() => { setEqBands(EQ_PRESETS[name]); setEqPreset(name); }} className="press px-3 py-1 rounded-full text-xs" style={{ background: eqPreset === name ? accent : "rgba(255,255,255,0.1)", color: eqPreset === name ? "#fff" : "#98989D" }}>{name}</button>
@@ -1875,7 +1873,7 @@ export default function MusicPlayer() {
                   </div>
                 )}
                 {showSleep && (
-                  <div className="rounded-xl py-1 w-40" style={{ background: "rgba(28,28,30,0.95)" }}>
+                  <div className="glass rounded-xl py-1 w-40" style={{ background: "rgba(28,28,30,0.6)" }}>
                     {[15, 30, 45, 60].map((m) => (<button key={m} onClick={() => setSleepMinutes(m)} className="block w-full text-left px-4 py-2 text-xs">{m} minutes</button>))}
                     <button onClick={() => setSleepMinutes(0)} className="block w-full text-left px-4 py-2 text-xs" style={{ color: "#FF453A" }}>Turn off</button>
                   </div>
@@ -2011,7 +2009,7 @@ export default function MusicPlayer() {
             <div className="text-xs mb-2" style={{ color: palette.subtext }}>THEME</div>
             <div className="flex gap-2 mb-5">
               {Object.keys(THEMES).map((k) => (
-                <button key={k} onClick={() => setTheme(k)} className="press flex-1 py-2 rounded-lg text-xs font-medium capitalize" style={{ background: THEMES[k].bg, color: THEMES[k].text, border: theme === k ? `2px solid ${THEMES[k].accent}` : "1px solid rgba(128,128,128,0.3)" }}>{k}</button>
+                <button key={k} onClick={() => setTheme(k)} className="press press-3d glass-tile flex-1 py-2 rounded-lg text-xs font-medium capitalize" style={{ background: THEMES[k].bg, color: THEMES[k].text, border: theme === k ? `2px solid ${THEMES[k].accent}` : "1px solid rgba(128,128,128,0.3)" }}>{k}</button>
               ))}
             </div>
 
@@ -2057,15 +2055,15 @@ export default function MusicPlayer() {
           <div className="px-5 pb-6" style={{ color: palette.text }}>
             <div className="text-sm font-semibold mb-4">Listening Stats</div>
             <div className="flex gap-3 mb-5">
-              <div className="flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
+              <div className="glass-tile flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
                 <div className="text-2xl font-extrabold">{weeklyPlays.length}</div>
                 <div className="text-xs" style={{ color: palette.subtext }}>plays this week</div>
               </div>
-              <div className="flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
+              <div className="glass-tile flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
                 <div className="text-2xl font-extrabold">{weeklyMinutes}</div>
                 <div className="text-xs" style={{ color: palette.subtext }}>minutes this week</div>
               </div>
-              <div className="flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
+              <div className="glass-tile flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
                 <div className="text-2xl font-extrabold">{totalLifetimePlays}</div>
                 <div className="text-xs" style={{ color: palette.subtext }}>lifetime plays</div>
               </div>
@@ -2120,6 +2118,14 @@ function ArtBox({ track, className, children }) {
       {track.artUrl && <img src={track.artUrl} alt="" className="absolute inset-0 w-full h-full object-cover" />}
       {!track.artUrl && children}
     </div>
+  );
+}
+function QuickTile({ label, icon, onClick, palette, theme }) {
+  return (
+    <button onClick={onClick} className={`press press-3d glass-tile flex items-center gap-0 rounded-lg overflow-hidden text-left ${theme === "light" ? "glass-light" : ""}`} style={{ height: 56, background: palette.surface }}>
+      <div className="w-14 h-14 shrink-0 flex items-center justify-center" style={{ background: palette.surface2 }}>{icon}</div>
+      <span className="text-xs font-semibold px-2.5 truncate flex-1">{label}</span>
+    </button>
   );
 }
 function EmptyState({ dragOver, message }) {
