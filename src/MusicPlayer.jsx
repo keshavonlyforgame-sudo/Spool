@@ -13,6 +13,11 @@ import {
 // =====================================================================
 // helpers
 // =====================================================================
+// =====================================================================
+// helpers — pure functions, no React/JSX. Split out of MusicPlayer.jsx
+// so the main component file is smaller and these are independently
+// testable / reusable.
+// =====================================================================
 const fmtTime = (s) => {
   if (!isFinite(s) || s < 0) s = 0;
   const m = Math.floor(s / 60);
@@ -20,6 +25,106 @@ const fmtTime = (s) => {
   return `${m}:${sec.toString().padStart(2, "0")}`;
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
+
+// WOW — haptic feedback helper. Silently no-ops on devices/browsers without
+// the Vibration API (iOS Safari, desktop) so it's always safe to call.
+const haptic = (pattern = 10) => {
+  try { if (navigator.vibrate) navigator.vibrate(pattern); } catch { /* unsupported */ }
+};
+
+// WOW — synced/karaoke lyrics: parse LRC-style "[mm:ss.xx] line" timestamps.
+// Returns an array of { time, text } sorted by time if the text contains at
+// least one timestamp, otherwise returns null (treat as plain lyrics).
+const parseLRC = (text) => {
+  if (!text) return null;
+  const lines = text.split("\n");
+  const out = [];
+  let any = false;
+  for (const line of lines) {
+    const m = line.match(/^\s*\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$/);
+    if (m) { any = true; out.push({ time: parseInt(m[1], 10) * 60 + parseFloat(m[2]), text: m[3] }); }
+  }
+  if (!any) return null;
+  return out.sort((a, b) => a.time - b.time);
+};
+const fmtLRCTime = (s) => {
+  const m = Math.floor(s / 60), sec = (s % 60).toFixed(2).padStart(5, "0");
+  return `${m.toString().padStart(2, "0")}:${sec}`;
+};
+
+// GOD-LEVEL — cinematic word-by-word karaoke. LRC only gives us a timestamp
+// per line, so we estimate per-word timing by spreading each line's window
+// (up to the start of the next line) across its words, weighted by word
+// length, so short words like "a" flash quicker than long ones.
+function estimateWordTimings(parsedLRC) {
+  if (!parsedLRC) return null;
+  return parsedLRC.map((line, i) => {
+    const words = line.text.split(/\s+/).filter(Boolean);
+    const nextTime = parsedLRC[i + 1] ? parsedLRC[i + 1].time : line.time + 4;
+    const span = Math.max(0.3, nextTime - line.time);
+    const totalChars = words.reduce((s, w) => s + w.length, 0) || 1;
+    let t = line.time;
+    const timed = words.map((w) => {
+      const dur = (w.length / totalChars) * span;
+      const start = t;
+      t += dur;
+      return { word: w, start };
+    });
+    return { time: line.time, text: line.text, words: timed };
+  });
+}
+
+// GOD-LEVEL — coarse BPM estimator. Runs an autocorrelation over the
+// already-computed peak envelope (see computePeaks) to guess tempo without
+// any extra decoding work. Not lab-grade, but close enough to drive beat
+// pulses and beat-matched crossfade timing.
+function estimateBPM(peaks, duration) {
+  if (!peaks || peaks.length < 16 || !duration) return null;
+  const secondsPerSample = duration / peaks.length;
+  const minBpm = 70, maxBpm = 175;
+  const minLag = Math.max(1, Math.round(60 / maxBpm / secondsPerSample));
+  const maxLag = Math.min(peaks.length - 1, Math.round(60 / minBpm / secondsPerSample));
+  const mean = peaks.reduce((a, b) => a + b, 0) / peaks.length;
+  const centered = peaks.map((p) => p - mean);
+  let bestLag = null, bestScore = -Infinity;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let sum = 0;
+    for (let i = 0; i + lag < centered.length; i++) sum += centered[i] * centered[i + lag];
+    if (sum > bestScore) { bestScore = sum; bestLag = lag; }
+  }
+  if (!bestLag) return null;
+  const bpm = 60 / (bestLag * secondsPerSample);
+  // fold into a sane display range
+  let out = bpm;
+  while (out < minBpm) out *= 2;
+  while (out > maxBpm) out /= 2;
+  return Math.round(out);
+}
+
+// GOD-LEVEL — synthetic impulse-response generator for the Reverb Rooms
+// feature (Concert Hall / Arena / Bedroom). No external IR files needed —
+// each "room" is a burst of decaying filtered noise shaped to feel like a
+// different space.
+function buildImpulseResponse(ctx, kind = "hall") {
+  const presets = {
+    hall: { seconds: 2.6, decay: 3.2, tone: 0.75 },
+    arena: { seconds: 4.2, decay: 2.2, tone: 0.55 },
+    bedroom: { seconds: 0.6, decay: 6.5, tone: 0.9 },
+  };
+  const p = presets[kind] || presets.hall;
+  const len = Math.floor(ctx.sampleRate * p.seconds);
+  const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      const t = i / len;
+      const decayEnv = Math.pow(1 - t, p.decay);
+      let sample = (Math.random() * 2 - 1) * decayEnv;
+      data[i] = sample * p.tone;
+    }
+  }
+  return buf;
+}
 
 const artHue = (name = "") => {
   let hash = 0;
@@ -30,6 +135,78 @@ const artGradient = (name) => {
   const h1 = artHue(name), h2 = (h1 + 46) % 360;
   return `linear-gradient(135deg, hsl(${h1} 70% 42%), hsl(${h2} 75% 24%))`;
 };
+
+// GOD-LEVEL — full-screen reactive visualizer renderer. Pure canvas drawing,
+// called once per animation frame from the main draw loop above so it shares
+// the same analyser data (no duplicate audio taps).
+let visParticles = null;
+function drawVisualizerFrame(canvas, data, accent, style) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2, cy = h / 2;
+  const n = data ? data.length : 32;
+
+  if (style === "rings") {
+    for (let i = 0; i < n; i += 2) {
+      const v = data ? data[i] / 255 : 0;
+      const radius = 20 + (i / n) * (Math.min(w, h) * 0.42) + v * 30;
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx.strokeStyle = accent;
+      ctx.globalAlpha = 0.15 + v * 0.5;
+      ctx.lineWidth = 1.5 + v * 4;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    return;
+  }
+
+  if (style === "bars3d") {
+    const bars = 40, maxR = Math.min(w, h) * 0.4;
+    for (let i = 0; i < bars; i++) {
+      const v = data ? data[Math.floor((i / bars) * n)] / 255 : 0;
+      const angle = (i / bars) * Math.PI * 2 - Math.PI / 2;
+      const len = 14 + v * maxR;
+      const x1 = cx + Math.cos(angle) * 26, y1 = cy + Math.sin(angle) * 26;
+      const x2 = cx + Math.cos(angle) * (26 + len), y2 = cy + Math.sin(angle) * (26 + len);
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+      ctx.strokeStyle = accent; ctx.lineWidth = Math.max(2, (w / bars) * 0.35); ctx.lineCap = "round";
+      ctx.globalAlpha = 0.35 + v * 0.65;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    return;
+  }
+
+  // "particles" default — a field of dots orbiting the center, pushed
+  // outward by frequency energy so it feels alive rather than mechanical.
+  if (!visParticles || visParticles.length !== 90) {
+    visParticles = Array.from({ length: 90 }, (_, i) => ({
+      angle: (i / 90) * Math.PI * 2,
+      baseR: 30 + Math.random() * Math.min(w, h) * 0.35,
+      speed: 0.0006 + Math.random() * 0.0012,
+      bin: Math.floor(Math.random() * n),
+      size: 1.5 + Math.random() * 2.5,
+    }));
+  }
+  const t = performance.now();
+  visParticles.forEach((p) => {
+    const v = data ? data[p.bin] / 255 : 0;
+    const angle = p.angle + t * p.speed;
+    const r = p.baseR + v * 60;
+    const x = cx + Math.cos(angle) * r, y = cy + Math.sin(angle) * r;
+    ctx.beginPath();
+    ctx.arc(x, y, p.size + v * 3, 0, Math.PI * 2);
+    ctx.fillStyle = accent;
+    ctx.globalAlpha = 0.25 + v * 0.7;
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+}
 
 let decodeCtx = null;
 const getDecodeCtx = () => {
@@ -179,6 +356,7 @@ function extractDominantColor(url) {
 
 // ---- IndexedDB persistence ----
 const DB_NAME = "spool-db", DB_VERSION = 1;
+
 function openDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -284,6 +462,12 @@ const EQ_PRESETS = {
   Rock: { bass: 4, mid: -2, treble: 4 },
 };
 
+// Vinyl Mode "paper" palette
+const PAPER_INK = "#1C1B17";
+const PAPER_SUB = "#8C8677";
+const PAPER_PILL = "#F8F5EE";
+const PAPER_PANEL = "rgba(28,27,23,0.05)";
+
 // =====================================================================
 // Vinyl Mode — a dedicated "paper" turntable screen inspired by MD Vinyl:
 // a warm, tilted record bleeding off the frame, a real tonearm you can
@@ -291,14 +475,23 @@ const EQ_PRESETS = {
 // original Vinyl Mode 2.0 features (RPM, shine, dust, reactive pulse,
 // crackle, scratch, color/backdrop swatches, EQ, sleep, speed) live on
 // in a compact light-themed control strip beneath the record.
-const PAPER_INK = "#1C1B17";
-const PAPER_SUB = "#8C8677";
-const PAPER_PILL = "#F8F5EE";
-const PAPER_PANEL = "rgba(28,27,23,0.05)";
-
-function PaperPill({ onClick, children, w = 46, h = 46, active }) {
+function ArtBox({ track, className, children }) {
   return (
-    <button onClick={onClick} className="press flex items-center justify-center shrink-0" style={{
+    <div
+      className={`${className} glass-tile`}
+      style={{ background: artGradient(track.name), position: "relative", overflow: "hidden" }}
+      role="img"
+      aria-label={track.name ? `Album art for ${track.name}` : "Album art"}
+    >
+      {track.artUrl && <img src={track.artUrl} alt="" className="absolute inset-0 w-full h-full object-cover" />}
+      {!track.artUrl && children}
+    </div>
+  );
+}
+
+function PaperPill({ onClick, children, w = 46, h = 46, active, label }) {
+  return (
+    <button onClick={onClick} aria-label={label} aria-pressed={active} className="press flex items-center justify-center shrink-0" style={{
       width: w, height: h, borderRadius: 999,
       background: active ? PAPER_INK : PAPER_PILL,
       boxShadow: "0 4px 12px rgba(28,27,23,0.14), inset 0 1px 0 rgba(255,255,255,0.7)",
@@ -419,11 +612,11 @@ function VinylTurntableView(props) {
         {/* Quick color + backdrop swatches, bottom of stage */}
         <div className="vinyl-swatch-row absolute left-0 right-0 flex items-center justify-center gap-1.5 overflow-x-auto px-3" style={{ bottom: 6, scrollbarWidth: "none" }}>
           {Object.entries(VINYL_COLORS).map(([key, v]) => (
-            <button key={key} onClick={(e) => { e.stopPropagation(); setVinylColor(key); }} className="press rounded-full shrink-0" style={{ width: 14, height: 14, background: v.swatch, border: vinylColor === key ? `2px solid ${PAPER_INK}` : "2px solid rgba(28,27,23,0.15)" }} />
+            <button key={key} onClick={(e) => { e.stopPropagation(); setVinylColor(key); }} aria-label={`Vinyl color ${v.name}`} aria-pressed={vinylColor === key} className="press rounded-full shrink-0" style={{ width: 14, height: 14, background: v.swatch, border: vinylColor === key ? `2px solid ${PAPER_INK}` : "2px solid rgba(28,27,23,0.15)" }} />
           ))}
           <span style={{ width: 1, height: 12, background: "rgba(28,27,23,0.18)", margin: "0 2px", flexShrink: 0 }} />
           {Object.entries(VINYL_BACKDROPS).map(([key, v]) => (
-            <button key={key} onClick={(e) => { e.stopPropagation(); setVinylBackdrop(key); }} className="press rounded-full shrink-0" style={{ width: 14, height: 14, background: v.css, border: vinylBackdrop === key ? `2px solid ${PAPER_INK}` : "2px solid rgba(28,27,23,0.15)" }} />
+            <button key={key} onClick={(e) => { e.stopPropagation(); setVinylBackdrop(key); }} aria-label={`Backdrop ${v.name}`} aria-pressed={vinylBackdrop === key} className="press rounded-full shrink-0" style={{ width: 14, height: 14, background: v.css, border: vinylBackdrop === key ? `2px solid ${PAPER_INK}` : "2px solid rgba(28,27,23,0.15)" }} />
           ))}
         </div>
 
@@ -453,38 +646,38 @@ function VinylTurntableView(props) {
       {/* Pill transport row, MD-Vinyl style */}
       <div className="px-7 pt-5 flex items-end justify-between gap-4">
         <div className="flex flex-col items-center gap-2">
-          <PaperPill onClick={togglePlay} w={112} h={48}>
+          <PaperPill onClick={togglePlay} w={112} h={48} label={isPlaying ? "Pause" : "Play"}>
             {isPlaying ? <Pause size={19} color={PAPER_INK} fill={PAPER_INK} /> : <Play size={19} color={PAPER_INK} fill={PAPER_INK} style={{ marginLeft: 2 }} />}
           </PaperPill>
           <span className="text-[10px] tracking-widest font-bold" style={{ color: PAPER_SUB }}>{isPlaying ? "PAUSE" : "PLAY"}</span>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex flex-col items-center gap-2">
-            <PaperPill onClick={() => stepTrack(-1)}><SkipBack size={17} color={PAPER_INK} fill={PAPER_INK} /></PaperPill>
+            <PaperPill onClick={() => stepTrack(-1)} label="Previous track"><SkipBack size={17} color={PAPER_INK} fill={PAPER_INK} /></PaperPill>
           </div>
           <div className="flex flex-col items-center gap-2">
-            <PaperPill onClick={() => stepTrack(1)}><SkipForward size={17} color={PAPER_INK} fill={PAPER_INK} /></PaperPill>
+            <PaperPill onClick={() => stepTrack(1)} label="Next track"><SkipForward size={17} color={PAPER_INK} fill={PAPER_INK} /></PaperPill>
           </div>
         </div>
       </div>
 
       {/* Volume */}
       <div className="px-7 pt-5 flex items-center gap-3">
-        <button onClick={() => setMuted((m) => !m)} className="press p-1" style={{ color: PAPER_SUB }}>{muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}</button>
-        <input type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} onChange={onVolumeChange} className="flex-1" />
+        <button onClick={() => setMuted((m) => !m)} aria-label={muted || volume === 0 ? "Unmute" : "Mute"} className="press p-1" style={{ color: PAPER_SUB }}>{muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}</button>
+        <input type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} onChange={onVolumeChange} className="flex-1" aria-label="Volume" />
       </div>
 
       {/* Compact feature strip — all the original features, restyled */}
       <div className="px-7 pt-4 pb-2 flex items-center gap-5 overflow-x-auto vinyl-swatch-row" style={{ scrollbarWidth: "none" }}>
-        <button onClick={() => setShuffle((s) => !s)} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: shuffle ? accent : PAPER_SUB }}><Shuffle size={17} /><span className="text-[9px] font-semibold">Shuffle</span></button>
-        <button onClick={cycleRepeat} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: repeatMode !== "off" ? accent : PAPER_SUB }}>{repeatMode === "one" ? <Repeat1 size={17} /> : <Repeat size={17} />}<span className="text-[9px] font-semibold">Repeat</span></button>
-        <button onClick={handleLoopTap} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: loopA != null ? accent : PAPER_SUB }}><Gauge size={17} /><span className="text-[9px] font-semibold">{loopB != null ? "Looping" : loopA != null ? "Set End" : "A-B Loop"}</span></button>
-        <button onClick={() => setNpView("lyrics")} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: PAPER_SUB }}><Mic2 size={17} /><span className="text-[9px] font-semibold">Lyrics</span></button>
-        <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); setShowVinylPanel(false); setShowSpeed(false); }} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: sleepEndsAt ? accent : PAPER_SUB }}><Moon size={17} /><span className="text-[9px] font-semibold">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
-        <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); setShowVinylPanel(false); setShowSpeed(false); }} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? accent : PAPER_SUB }}><SlidersHorizontal size={17} /><span className="text-[9px] font-semibold">EQ</span></button>
-        <button onClick={() => { setShowSpeed((s) => !s); setShowEq(false); setShowSleep(false); setShowVinylPanel(false); }} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: showSpeed || playbackRate !== 1 ? accent : PAPER_SUB }}><Gauge size={17} /><span className="text-[9px] font-semibold">{playbackRate}x</span></button>
-        <button onClick={() => { setShowVinylPanel((s) => !s); setShowEq(false); setShowSleep(false); setShowSpeed(false); }} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: showVinylPanel ? accent : PAPER_SUB }}><Disc3 size={17} /><span className="text-[9px] font-semibold">Turntable</span></button>
-        <button onClick={() => setNpView("queue")} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: PAPER_SUB }}><ListMusic size={17} /><span className="text-[9px] font-semibold">Up Next</span></button>
+        <button onClick={() => setShuffle((s) => !s)} aria-label="Toggle shuffle" aria-pressed={shuffle} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: shuffle ? accent : PAPER_SUB }}><Shuffle size={17} /><span className="text-[9px] font-semibold">Shuffle</span></button>
+        <button onClick={cycleRepeat} aria-label={`Repeat mode: ${repeatMode}`} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: repeatMode !== "off" ? accent : PAPER_SUB }}>{repeatMode === "one" ? <Repeat1 size={17} /> : <Repeat size={17} />}<span className="text-[9px] font-semibold">Repeat</span></button>
+        <button onClick={handleLoopTap} aria-label="Set A-B loop point" className="press flex flex-col items-center gap-1 shrink-0" style={{ color: loopA != null ? accent : PAPER_SUB }}><Gauge size={17} /><span className="text-[9px] font-semibold">{loopB != null ? "Looping" : loopA != null ? "Set End" : "A-B Loop"}</span></button>
+        <button onClick={() => setNpView("lyrics")} aria-label="Show lyrics" className="press flex flex-col items-center gap-1 shrink-0" style={{ color: PAPER_SUB }}><Mic2 size={17} /><span className="text-[9px] font-semibold">Lyrics</span></button>
+        <button onClick={() => { setShowSleep((s) => !s); setShowEq(false); setShowVinylPanel(false); setShowSpeed(false); }} aria-label="Sleep timer" aria-expanded={showSleep} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: sleepEndsAt ? accent : PAPER_SUB }}><Moon size={17} /><span className="text-[9px] font-semibold">{sleepRemaining != null ? fmtTime(sleepRemaining / 1000) : "Sleep"}</span></button>
+        <button onClick={() => { setShowEq((s) => !s); setShowSleep(false); setShowVinylPanel(false); setShowSpeed(false); }} aria-label="Equalizer" aria-expanded={showEq} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: showEq || eqBands.bass || eqBands.mid || eqBands.treble ? accent : PAPER_SUB }}><SlidersHorizontal size={17} /><span className="text-[9px] font-semibold">EQ</span></button>
+        <button onClick={() => { setShowSpeed((s) => !s); setShowEq(false); setShowSleep(false); setShowVinylPanel(false); }} aria-label="Playback speed" aria-expanded={showSpeed} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: showSpeed || playbackRate !== 1 ? accent : PAPER_SUB }}><Gauge size={17} /><span className="text-[9px] font-semibold">{playbackRate}x</span></button>
+        <button onClick={() => { setShowVinylPanel((s) => !s); setShowEq(false); setShowSleep(false); setShowSpeed(false); }} aria-label="Turntable settings" aria-expanded={showVinylPanel} className="press flex flex-col items-center gap-1 shrink-0" style={{ color: showVinylPanel ? accent : PAPER_SUB }}><Disc3 size={17} /><span className="text-[9px] font-semibold">Turntable</span></button>
+        <button onClick={() => setNpView("queue")} aria-label="Show up next queue" className="press flex flex-col items-center gap-1 shrink-0" style={{ color: PAPER_SUB }}><ListMusic size={17} /><span className="text-[9px] font-semibold">Up Next</span></button>
       </div>
 
       {showVinylPanel && (
@@ -545,6 +738,7 @@ function VinylTurntableView(props) {
   );
 }
 
+
 // =====================================================================
 export default function MusicPlayer() {
   const [loaded, setLoaded] = useState(false);
@@ -556,7 +750,12 @@ export default function MusicPlayer() {
   const [positions, setPositions] = useState({});
   const [likedIds, setLikedIds] = useState([]);
 
-  const [activeTab, setActiveTab] = useState("home");
+  const [activeTab, setActiveTab] = useState(() => {
+    try {
+      const t = new URLSearchParams(window.location.search).get("tab");
+      return t === "library" || t === "search" ? t : "home";
+    } catch { return "home"; }
+  });
   const [openPlaylistId, setOpenPlaylistId] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [librarySort, setLibrarySort] = useState("recent");
@@ -584,6 +783,10 @@ export default function MusicPlayer() {
   const [dragY, setDragY] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [artSwipeX, setArtSwipeX] = useState(0);
+  const [artSwipeY, setArtSwipeY] = useState(0);
+  const [artFlipped, setArtFlipped] = useState(false);
+  const artDraggedRef = useRef(false);
+  const artTouchStartY = useRef(0);
   const [showEq, setShowEq] = useState(false);
   const [eqBands, setEqBands] = useState({ bass: 0, mid: 0, treble: 0 });
   const [eqPreset, setEqPreset] = useState("Flat");
@@ -636,10 +839,63 @@ export default function MusicPlayer() {
   const [celebratedMilestones, setCelebratedMilestones] = useState([]);
   const [confettiMilestone, setConfettiMilestone] = useState(null);
   const [storageEstimate, setStorageEstimate] = useState(null);
+
+  // ---- WOW batch: haptics, lock-screen controls, shake-to-shuffle, burst,
+  // synced lyrics, smart mixes, floating bubble player, delete-undo ----
+  const [shakeToShuffle, setShakeToShuffle] = useState(false);
+  const [bubbleMode, setBubbleMode] = useState(false);
+  const [bubblePos, setBubblePos] = useState({ x: 300, y: 500 });
+  const [burstKey, setBurstKey] = useState(0);
+  const [showBurst, setShowBurst] = useState(false);
+  const [lastDeleted, setLastDeleted] = useState(null); // { track, playlistId } for Undo toast
+  const shakeLastMag = useRef(null);
+  const shakeCooldown = useRef(0);
+  const bubbleDragRef = useRef(null);
+  const bubbleDraggedRef = useRef(false);
   const backupInputRef = useRef(null);
   const folderInputRef = useRef(null);
   const pipCanvasRef = useRef(null);
   const pipVideoRef = useRef(null);
+
+  // ---- GOD-LEVEL experience features ----
+  const [showExperienceSheet, setShowExperienceSheet] = useState(false);
+  const [showVisualizer, setShowVisualizer] = useState(false);
+  const [visualizerStyle, setVisualizerStyle] = useState("particles"); // particles | rings | bars3d
+  const [beatPulseEnabled, setBeatPulseEnabled] = useState(false);
+  const [morphBgEnabled, setMorphBgEnabled] = useState(false);
+  const [spatialAudioEnabled, setSpatialAudioEnabled] = useState(false);
+  const [reverbRoom, setReverbRoom] = useState("off"); // off | hall | arena | bedroom
+  const [voiceControlEnabled, setVoiceControlEnabled] = useState(false);
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [voiceHeard, setVoiceHeard] = useState("");
+  const [gestureVolumeEnabled, setGestureVolumeEnabled] = useState(true);
+  const [volumeHUD, setVolumeHUD] = useState(null); // 0..1 while dragging, else null
+  const [focusModeOpen, setFocusModeOpen] = useState(false);
+  const [beatMatchCrossfade, setBeatMatchCrossfade] = useState(false);
+  const [bpmMap, setBpmMap] = useState({});
+  const [liveWallpaperOpen, setLiveWallpaperOpen] = useState(false);
+  const [cinematicKaraokeOpen, setCinematicKaraokeOpen] = useState(false);
+  const [heartBurstKey, setHeartBurstKey] = useState(0);
+  const [showHeartBurst, setShowHeartBurst] = useState(false);
+
+  const pannerRef = useRef(null);
+  const convolverRef = useRef(null);
+  const reverbWetGainRef = useRef(null);
+  const reverbDryGainRef = useRef(null);
+  const spatialPhaseRef = useRef(0);
+  const spatialEnabledRef = useRef(false);
+  const beatPulseElRef = useRef(null);
+  const beatHistoryRef = useRef([]);
+  const lastBeatAtRef = useRef(0);
+  const beatPulseEnabledRef = useRef(false);
+  const recognitionRef = useRef(null);
+  const volumeGestureRef = useRef(null);
+  const gestureVolumeElRef = useRef(null);
+  const visualizerCanvasRef = useRef(null);
+  const lastArtTapRef = useRef(0);
+  const singleTapTimeoutRef = useRef(null);
+  const bpmMapRef = useRef({});
+  const beatMatchCrossfadeRef = useRef(false);
 
   const audioARef = useRef(null);
   const audioBRef = useRef(null);
@@ -677,6 +933,13 @@ export default function MusicPlayer() {
   const toastTimer = useRef(null);
   const resumeSeekRef = useRef(null);
   const lastSaveRef = useRef(0);
+  // WOW — continue where you left off: remember the last queue + track
+  // across app restarts (closing the PWA, phone reboot, etc.), not just
+  // each track's own resume position. pendingRestoreRef holds what we read
+  // from IndexedDB until the library itself has finished loading, since we
+  // need real track objects (not just ids) before we can queue one up.
+  const pendingRestoreRef = useRef(null);
+  const restoreAppliedRef = useRef(false);
 
   const currentTrack = library.find((t) => t.id === queue[queueIndex]) || null;
   const activePlaylist = playlists.find((p) => p.id === openPlaylistId) || null;
@@ -686,6 +949,14 @@ export default function MusicPlayer() {
   const otherDeck = (d) => (d === "A" ? "B" : "A");
 
   const showToast = (msg) => { setToast(msg); clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(null), 1800); };
+  const undoTimerRef = useRef(null);
+  // WOW — Undo toast: gives a 5s window to reverse a delete instead of the
+  // old one-way "Deleted" toast, so an accidental swipe/tap is forgivable.
+  const showUndoToast = (message, onUndo) => {
+    setLastDeleted({ message, onUndo });
+    clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = setTimeout(() => setLastDeleted(null), 5000);
+  };
 
   // ------------------------------------------------------------------
   useEffect(() => {
@@ -716,6 +987,19 @@ export default function MusicPlayer() {
         const lk = await idbGetMeta("liked"); if (lk) setLikedIds(lk);
         const pr = await idbGetMeta("playbackRate"); if (pr) setPlaybackRate(pr);
         const cf = await idbGetMeta("crossfadeSec"); if (cf != null) setCrossfadeSec(cf);
+        const sts = await idbGetMeta("shakeToShuffle"); if (sts != null) setShakeToShuffle(sts);
+        const bm = await idbGetMeta("bubbleMode"); if (bm != null) setBubbleMode(bm);
+        const qs = await idbGetMeta("queueState");
+        if (qs && Array.isArray(qs.queue) && qs.queue.length) pendingRestoreRef.current = qs;
+        const bp = await idbGetMeta("beatPulseEnabled"); if (bp != null) setBeatPulseEnabled(bp);
+        const mb = await idbGetMeta("morphBgEnabled"); if (mb != null) setMorphBgEnabled(mb);
+        const sa = await idbGetMeta("spatialAudioEnabled"); if (sa != null) setSpatialAudioEnabled(sa);
+        const rr = await idbGetMeta("reverbRoom"); if (rr) setReverbRoom(rr);
+        const vce = await idbGetMeta("voiceControlEnabled"); if (vce != null) setVoiceControlEnabled(vce);
+        const gve = await idbGetMeta("gestureVolumeEnabled"); if (gve != null) setGestureVolumeEnabled(gve);
+        const bmc = await idbGetMeta("beatMatchCrossfade"); if (bmc != null) setBeatMatchCrossfade(bmc);
+        const bmMap = await idbGetMeta("bpmMap"); if (bmMap) setBpmMap(bmMap);
+        const vs = await idbGetMeta("visualizerStyle"); if (vs) setVisualizerStyle(vs);
       } catch { /* fresh start */ }
       setLoaded(true);
     })();
@@ -738,6 +1022,36 @@ export default function MusicPlayer() {
   useEffect(() => { if (loaded) idbSetMeta("liked", likedIds); }, [likedIds, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("playbackRate", playbackRate); }, [playbackRate, loaded]);
   useEffect(() => { if (loaded) idbSetMeta("crossfadeSec", crossfadeSec); }, [crossfadeSec, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("shakeToShuffle", shakeToShuffle); }, [shakeToShuffle, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("bubbleMode", bubbleMode); }, [bubbleMode, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("queueState", { queue, queueIndex, queueSource }); }, [queue, queueIndex, queueSource, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("beatPulseEnabled", beatPulseEnabled); }, [beatPulseEnabled, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("morphBgEnabled", morphBgEnabled); }, [morphBgEnabled, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("spatialAudioEnabled", spatialAudioEnabled); }, [spatialAudioEnabled, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("reverbRoom", reverbRoom); }, [reverbRoom, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("voiceControlEnabled", voiceControlEnabled); }, [voiceControlEnabled, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("gestureVolumeEnabled", gestureVolumeEnabled); }, [gestureVolumeEnabled, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("beatMatchCrossfade", beatMatchCrossfade); }, [beatMatchCrossfade, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("bpmMap", bpmMap); }, [bpmMap, loaded]);
+  useEffect(() => { if (loaded) idbSetMeta("visualizerStyle", visualizerStyle); }, [visualizerStyle, loaded]);
+  // WOW — apply the restored queue once the library has actually loaded, so
+  // Now Playing shows the same song + queue you had before closing the app,
+  // paused and cued up at your saved position (see resumeSeekRef in
+  // loadTrackById) rather than starting silent on a blank player.
+  useEffect(() => {
+    if (!loaded || restoreAppliedRef.current || !library.length) return;
+    restoreAppliedRef.current = true;
+    const qs = pendingRestoreRef.current;
+    if (!qs) return;
+    const validIds = qs.queue.filter((id) => library.some((t) => t.id === id));
+    if (!validIds.length) return;
+    const origId = qs.queue[qs.queueIndex];
+    const newIndex = Math.max(0, validIds.indexOf(origId));
+    setQueue(validIds);
+    setQueueIndex(newIndex);
+    setQueueSource(qs.queueSource || "Now Playing");
+    loadTrackById(validIds[newIndex], false);
+  }, [loaded, library]);
   useEffect(() => { crossfadeSecRef.current = crossfadeSec; }, [crossfadeSec]);
   useEffect(() => {
     [audioARef.current, audioBRef.current].forEach((el) => { if (el) el.playbackRate = playbackRate; });
@@ -771,7 +1085,10 @@ export default function MusicPlayer() {
   const glassBar = theme === "light" ? "rgba(255,255,255,0.85)" : "rgba(20,20,22,0.85)";
   const glassPanel = theme === "light" ? "rgba(255,255,255,0.9)" : "rgba(44,44,46,0.85)";
   const sheetBg = theme === "light" ? "#FFFFFF" : palette.surface;
-  const filteredTagLibrary = activeTagFilter ? library.filter((t) => (tagsMap[t.id] || []).includes(activeTagFilter)) : null;
+  const filteredTagLibrary = useMemo(
+    () => (activeTagFilter ? library.filter((t) => (tagsMap[t.id] || []).includes(activeTagFilter)) : null),
+    [activeTagFilter, library, tagsMap]
+  );
 
   const weekMs = 7 * 24 * 60 * 60 * 1000;
   const weekAgo = Date.now() - weekMs;
@@ -783,25 +1100,68 @@ export default function MusicPlayer() {
   const totalLifetimePlays = Object.values(playCounts).reduce((a, b) => a + b, 0);
   const mostPlayed = [...library].filter((t) => playCounts[t.id] > 0).sort((a, b) => (playCounts[b.id] || 0) - (playCounts[a.id] || 0)).slice(0, 25);
   const likedTracks = likedIds.map((id) => library.find((t) => t.id === id)).filter(Boolean);
-  const toggleLike = (id) => setLikedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [id, ...prev]));
 
-  const sortedLibrary = (() => {
+  // WOW — auto smart mixes: "Discover Again" resurfaces songs you used to
+  // love (played or liked) but haven't heard lately, and a time-of-day mix
+  // ("Late Night Mix" / "Morning Mix" / "Daytime Mix") reshuffles your
+  // library differently depending on when you open the app.
+  const discoverAgain = useMemo(() => {
+    const recentIds = new Set(recentlyPlayed.slice(0, 20).map((r) => r.id));
+    return library
+      .filter((t) => (playCounts[t.id] > 0 || likedIds.includes(t.id)) && !recentIds.has(t.id))
+      .sort((a, b) => (playCounts[a.id] || 0) - (playCounts[b.id] || 0))
+      .slice(0, 25);
+  }, [library, playCounts, likedIds, recentlyPlayed]);
+  const currentHour = new Date().getHours();
+  const timeMixLabel = currentHour >= 21 || currentHour < 5 ? "Late Night Mix" : currentHour < 12 ? "Morning Mix" : "Daytime Mix";
+  const timeMixTracks = useMemo(() => {
+    const source = likedTracks.length >= 5 ? likedTracks : library;
+    const arr = [...source];
+    for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; }
+    return arr.slice(0, 25);
+  }, [library.length, likedTracks.length, currentHour]);
+  const toggleLike = (id) => { haptic(id && !likedIds.includes(id) ? [10, 40, 10] : 10); setLikedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [id, ...prev])); };
+
+  const sortedLibrary = useMemo(() => {
     const arr = [...(filteredTagLibrary || library)];
     if (librarySort === "name") arr.sort((a, b) => a.name.localeCompare(b.name));
     else if (librarySort === "duration") arr.sort((a, b) => (b.duration || 0) - (a.duration || 0));
     else arr.sort((a, b) => b.addedAt - a.addedAt);
     return arr;
-  })();
+  }, [filteredTagLibrary, library, librarySort]);
   const playlistTracks = activePlaylist ? activePlaylist.trackIds.map((tid) => library.find((t) => t.id === tid)).filter(Boolean) : [];
 
   // ------------------------------------------------------------------
   // Web Audio graph — TWO decks mixed together for real crossfade
   // deckA/B -> gainA/B -> mix -> bass -> mid -> treble -> analyser -> masterGain -> out
   // ------------------------------------------------------------------
+  // Try to open the AudioContext at the highest sample rate the hardware/
+  // browser will actually give us, so hi-res files (96kHz/192kHz) aren't
+  // silently downsampled to the device's default (usually 44.1/48kHz)
+  // before they hit the EQ/crossfade graph. Browsers clamp to whatever the
+  // audio device supports, so we just ask for the biggest common rates in
+  // order and take whatever we're granted.
+  const openHighestRateContext = (AC) => {
+    const candidates = [192000, 96000, 48000, 44100];
+    for (const rate of candidates) {
+      try {
+        const ctx = new AC({ sampleRate: rate });
+        if (ctx) return ctx;
+      } catch (e) {
+        // rate not supported by this browser/device — try the next one
+      }
+    }
+    // last resort: let the browser pick its own default
+    return new AC();
+  };
+
   const ensureAudioGraph = useCallback(() => {
     if (audioCtxRef.current || !audioARef.current || !audioBRef.current) return;
     const AC = window.AudioContext || window.webkitAudioContext;
-    const ctx = new AC();
+    const ctx = openHighestRateContext(AC);
+    // Useful when debugging playback quality on hi-res files — logs what
+    // rate the browser actually granted us (it may clamp to hardware max).
+    console.log(`[spool] AudioContext running at ${ctx.sampleRate} Hz`);
     const srcA = ctx.createMediaElementSource(audioARef.current);
     const srcB = ctx.createMediaElementSource(audioBRef.current);
     const gainA = ctx.createGain(); gainA.gain.value = 1;
@@ -815,14 +1175,48 @@ export default function MusicPlayer() {
     const analyser = ctx.createAnalyser(); analyser.fftSize = 64;
     const normGain = ctx.createGain(); normGain.gain.value = 1;
     const masterGain = ctx.createGain(); masterGain.gain.value = 1;
-    mix.connect(bass); bass.connect(mid); mid.connect(treble); treble.connect(analyser); analyser.connect(normGain); normGain.connect(masterGain); masterGain.connect(ctx.destination);
+    // GOD-LEVEL — 8D/spatial panner (auto-modulated in the draw loop below)
+    // and a Reverb Rooms send (dry + convolver-wet mixed back together).
+    const panner = ctx.createStereoPanner(); panner.pan.value = 0;
+    const dryGain = ctx.createGain(); dryGain.gain.value = 1;
+    const wetGain = ctx.createGain(); wetGain.gain.value = 0;
+    const convolver = ctx.createConvolver();
+    try { convolver.buffer = buildImpulseResponse(ctx, "hall"); } catch {}
+    mix.connect(bass); bass.connect(mid); mid.connect(treble); treble.connect(analyser); analyser.connect(normGain); normGain.connect(masterGain);
+    masterGain.connect(panner);
+    panner.connect(dryGain); dryGain.connect(ctx.destination);
+    panner.connect(convolver); convolver.connect(wetGain); wetGain.connect(ctx.destination);
     const crackleGain = ctx.createGain(); crackleGain.gain.value = 0;
     crackleGain.connect(ctx.destination);
     audioCtxRef.current = ctx; gainARef.current = gainA; gainBRef.current = gainB;
     analyserRef.current = analyser; masterGainRef.current = masterGain; normGainRef.current = normGain;
     crackleGainRef.current = crackleGain;
+    pannerRef.current = panner; convolverRef.current = convolver;
+    reverbDryGainRef.current = dryGain; reverbWetGainRef.current = wetGain;
     eqRefs.current = { bass, mid, treble };
   }, []);
+
+  // GOD-LEVEL — Reverb Rooms: swap the convolver's impulse response and
+  // crossfade the wet/dry mix whenever the room selection changes.
+  useEffect(() => {
+    const ctx = audioCtxRef.current, convolver = convolverRef.current, wet = reverbWetGainRef.current, dry = reverbDryGainRef.current;
+    if (!ctx || !convolver || !wet || !dry) return;
+    const now = ctx.currentTime;
+    if (reverbRoom === "off") {
+      wet.gain.setTargetAtTime(0, now, 0.25);
+      dry.gain.setTargetAtTime(1, now, 0.25);
+      return;
+    }
+    try { convolver.buffer = buildImpulseResponse(ctx, reverbRoom); } catch {}
+    const wetLevel = reverbRoom === "bedroom" ? 0.22 : reverbRoom === "arena" ? 0.45 : 0.35;
+    wet.gain.setTargetAtTime(wetLevel, now, 0.25);
+    dry.gain.setTargetAtTime(1 - wetLevel * 0.4, now, 0.25);
+  }, [reverbRoom]);
+
+  useEffect(() => { spatialEnabledRef.current = spatialAudioEnabled; if (!spatialAudioEnabled && pannerRef.current) pannerRef.current.pan.value = 0; }, [spatialAudioEnabled]);
+  useEffect(() => { beatPulseEnabledRef.current = beatPulseEnabled; }, [beatPulseEnabled]);
+  useEffect(() => { beatMatchCrossfadeRef.current = beatMatchCrossfade; }, [beatMatchCrossfade]);
+  useEffect(() => { bpmMapRef.current = bpmMap; }, [bpmMap]);
 
   useEffect(() => {
     const { bass, mid, treble } = eqRefs.current;
@@ -911,6 +1305,55 @@ export default function MusicPlayer() {
         analyserRef.current.getByteFrequencyData(data);
         level = data.reduce((a, b) => a + b, 0) / data.length / 255;
       }
+
+      // GOD-LEVEL — 8D / spatial audio: slowly sweep the stereo panner left
+      // to right and back like the sound is orbiting your head. The phase
+      // only advances while music is actually playing.
+      if (pannerRef.current) {
+        if (spatialEnabledRef.current && isPlaying) {
+          spatialPhaseRef.current += 0.006;
+          pannerRef.current.pan.value = Math.sin(spatialPhaseRef.current) * 0.9;
+        } else if (pannerRef.current.pan.value !== 0) {
+          pannerRef.current.pan.value *= 0.9;
+        }
+      }
+
+      // GOD-LEVEL — lightweight beat detector: watch the bass bins for a
+      // sudden spike above their own recent rolling average, debounced so
+      // it can't fire faster than a very fast song's beat.
+      if (data && isPlaying) {
+        const bassBins = Math.max(1, Math.floor(data.length * 0.18));
+        let bassSum = 0;
+        for (let i = 0; i < bassBins; i++) bassSum += data[i];
+        const bassEnergy = bassSum / bassBins / 255;
+        const hist = beatHistoryRef.current;
+        hist.push(bassEnergy);
+        if (hist.length > 40) hist.shift();
+        const avg = hist.reduce((a, b) => a + b, 0) / hist.length;
+        const now = performance.now();
+        if (bassEnergy > avg * 1.35 && bassEnergy > 0.28 && now - lastBeatAtRef.current > 260) {
+          lastBeatAtRef.current = now;
+          if (beatPulseEnabledRef.current && beatPulseElRef.current) {
+            beatPulseElRef.current.style.transition = "transform 0.06s ease-out";
+            beatPulseElRef.current.style.transform = `scale(${1.045 + Math.min(0.05, bassEnergy - avg)})`;
+            requestAnimationFrame(() => {
+              if (beatPulseElRef.current) {
+                beatPulseElRef.current.style.transition = "transform 0.32s ease-out";
+                beatPulseElRef.current.style.transform = "scale(1)";
+              }
+            });
+          }
+        }
+      }
+
+      // GOD-LEVEL — swipe-volume HUD ring, and full-screen visualizer canvas
+      if (gestureVolumeElRef.current) {
+        // painted directly on gesture (see onVolumeGesture*); nothing to do per-frame
+      }
+      if (visualizerCanvasRef.current && showVisualizer) {
+        drawVisualizerFrame(visualizerCanvasRef.current, data, accent, visualizerStyle);
+      }
+
       const vu = vuCanvasRef.current;
       if (vu) {
         const c = vu.getContext("2d");
@@ -957,7 +1400,16 @@ export default function MusicPlayer() {
         }
       }
       if (bgGlowRef.current) {
-        bgGlowRef.current.style.transform = `scale(${1 + level * 0.18})`;
+        if (morphBgEnabled) {
+          const t = performance.now() / 1000;
+          const hue = Math.sin(t / 9) * 35;
+          const dx = Math.sin(t / 11) * 4, dy = Math.cos(t / 13) * 4;
+          bgGlowRef.current.style.transform = `translate(${dx}%, ${dy}%) scale(${1.05 + level * 0.18})`;
+          bgGlowRef.current.style.filter = `blur(90px) hue-rotate(${hue}deg)`;
+        } else {
+          bgGlowRef.current.style.transform = `scale(${1 + level * 0.18})`;
+          bgGlowRef.current.style.filter = "blur(90px)";
+        }
         bgGlowRef.current.style.opacity = String(0.5 + level * 0.35);
       }
       // Vinyl Mode 2.0 — the record subtly breathes/glows with the music,
@@ -1030,6 +1482,14 @@ export default function MusicPlayer() {
     const track = library.find((t) => t.id === id);
     if (!track) return;
     ensureAudioGraph();
+
+    // GOD-LEVEL — lazily estimate & cache this track's BPM the first time
+    // it's played, so the beat pulse and beat-matched crossfade have
+    // something to work with without ever blocking playback.
+    if (bpmMapRef.current[id] === undefined && track.peaks) {
+      const bpm = estimateBPM(track.peaks, track.duration);
+      if (bpm) setBpmMap((prev) => ({ ...prev, [id]: bpm }));
+    }
     if (audioCtxRef.current?.state === "suspended") audioCtxRef.current.resume();
 
     const prevDeck = activeDeckRef.current;
@@ -1057,7 +1517,19 @@ export default function MusicPlayer() {
     targetAudio.currentTime = 0;
     targetAudio.playbackRate = playbackRate;
 
-    const cfSec = crossfadeSecRef.current;
+    let cfSec = crossfadeSecRef.current;
+    // GOD-LEVEL — DJ-style beat-matched crossfade: instead of a fixed
+    // duration, blend across a whole number of the outgoing track's beats
+    // (closest match to the user's chosen crossfade length) so the two
+    // songs actually line up rhythmically instead of just fading blindly.
+    if (beatMatchCrossfadeRef.current && cfSec > 0) {
+      const outgoingBpm = currentTrack ? bpmMapRef.current[currentTrack.id] : null;
+      if (outgoingBpm) {
+        const beatSec = 60 / outgoingBpm;
+        const beats = Math.max(2, Math.round(cfSec / beatSec));
+        cfSec = +(beats * beatSec).toFixed(2);
+      }
+    }
     if (doCrossfade && cfSec > 0) {
       crossfadingRef.current = true;
       const ctx = audioCtxRef.current;
@@ -1095,11 +1567,17 @@ export default function MusicPlayer() {
     if (!a || !currentTrack) return;
     ensureAudioGraph();
     if (audioCtxRef.current?.state === "suspended") audioCtxRef.current.resume();
+    haptic(12);
     if (isPlaying) { a.pause(); setIsPlaying(false); } else { a.play().catch(() => {}); setIsPlaying(true); }
+    // WOW — album-art particle burst: a quick confetti-like puff around the
+    // artwork every time playback is toggled, purely cosmetic delight.
+    setBurstKey((k) => k + 1); setShowBurst(true);
+    setTimeout(() => setShowBurst(false), 750);
   };
 
   const stepTrack = (dir) => {
     if (!queue.length) return;
+    haptic(8);
     let idx = queueIndex;
     if (shuffle) {
       let next = Math.floor(Math.random() * queue.length);
@@ -1142,6 +1620,66 @@ export default function MusicPlayer() {
     if (!waveCanvasRef.current || !duration) return;
     const rect = waveCanvasRef.current.getBoundingClientRect();
     seekTo(((e.clientX - rect.left) / rect.width) * duration);
+  };
+
+  // WOW — lock-screen / hardware media controls via the MediaSession API:
+  // shows real title + artwork on the phone's lock screen & notification
+  // shade. (Action handlers — play/pause/skip/seek — are registered in the
+  // effect further below, which has the right dependencies so they never
+  // go stale; keeping metadata in its own effect means the lock screen
+  // always shows the richest info: real album/source name + both artwork
+  // sizes, instead of being clobbered by a second, thinner metadata write.)
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || !currentTrack) return;
+    navigator.mediaSession.metadata = new window.MediaMetadata({
+      title: currentTrack.name,
+      artist: "Spool",
+      album: queueSource || "Library",
+      artwork: currentTrack.artUrl ? [
+        { src: currentTrack.artUrl, sizes: "512x512", type: "image/png" },
+        { src: currentTrack.artUrl, sizes: "192x192", type: "image/png" },
+      ] : [],
+    });
+  }, [currentTrack?.id, queueSource]);
+  useEffect(() => {
+    if (!("mediaSession" in navigator)) return;
+    navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
+  }, [isPlaying]);
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || !navigator.mediaSession.setPositionState || !duration) return;
+    try { navigator.mediaSession.setPositionState({ duration, position: Math.min(currentTime, duration), playbackRate }); } catch {}
+  }, [duration, playbackRate, Math.floor(currentTime)]);
+
+  // WOW — shake-to-shuffle: shake the phone to jump into a fresh shuffle of
+  // the whole library. Requires the Shake to Shuffle toggle in Settings
+  // (iOS needs an explicit permission prompt, gated behind a user tap there).
+  useEffect(() => {
+    if (!shakeToShuffle) return;
+    const onMotion = (e) => {
+      const a = e.accelerationIncludingGravity || e.acceleration;
+      if (!a) return;
+      const mag = Math.sqrt((a.x || 0) ** 2 + (a.y || 0) ** 2 + (a.z || 0) ** 2);
+      const now = Date.now();
+      if (shakeLastMag.current != null && Math.abs(mag - shakeLastMag.current) > 28 && now > shakeCooldown.current) {
+        shakeCooldown.current = now + 1800;
+        haptic([15, 60, 15]);
+        showToast("Shook up! 🔀");
+        shuffleAll();
+      }
+      shakeLastMag.current = mag;
+    };
+    window.addEventListener("devicemotion", onMotion);
+    return () => window.removeEventListener("devicemotion", onMotion);
+  }, [shakeToShuffle, library]);
+  const enableShakeToShuffle = async () => {
+    try {
+      if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+        const perm = await DeviceMotionEvent.requestPermission();
+        if (perm !== "granted") { showToast("Motion permission denied"); return; }
+      }
+      setShakeToShuffle(true);
+      showToast("Shake to Shuffle enabled");
+    } catch { showToast("Not supported on this device"); }
   };
 
   // Vinyl Mode 2.0 — grab the spinning record itself and scrub/scratch
@@ -1266,14 +1804,11 @@ export default function MusicPlayer() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
-  useEffect(() => {
-    if (!("mediaSession" in navigator) || !currentTrack) return;
-    navigator.mediaSession.metadata = new window.MediaMetadata({
-      title: currentTrack.name, artist: "Spool", album: "",
-      artwork: currentTrack.artUrl ? [{ src: currentTrack.artUrl, sizes: "512x512", type: "image/png" }] : [],
-    });
-  }, [currentTrack]);
-  useEffect(() => { if ("mediaSession" in navigator) navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused"; }, [isPlaying]);
+  // Hardware/lock-screen action handlers live in their own effect with the
+  // full set of dependencies the handlers actually close over (queue,
+  // shuffle, repeat, etc.) so play/pause/skip from a headset or smartwatch
+  // never fires a stale version of these callbacks. Cleaned up on unmount
+  // so a closed player doesn't leave dangling handlers behind.
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     navigator.mediaSession.setActionHandler("play", () => togglePlay());
@@ -1281,6 +1816,7 @@ export default function MusicPlayer() {
     navigator.mediaSession.setActionHandler("previoustrack", () => stepTrack(-1));
     navigator.mediaSession.setActionHandler("nexttrack", () => stepTrack(1));
     navigator.mediaSession.setActionHandler("seekto", (d) => { if (d.seekTime != null) seekTo(d.seekTime); });
+    return () => { try { ["play", "pause", "previoustrack", "nexttrack", "seekto"].forEach((a) => navigator.mediaSession.setActionHandler(a, null)); } catch {} };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queue, queueIndex, shuffle, repeatMode, isPlaying, duration]);
 
@@ -1420,26 +1956,70 @@ export default function MusicPlayer() {
     }, 800);
   };
 
-  // WOW — playlist backup / export & import (structure only; audio stays local)
+  // WOW — full app-data backup / export & import (structure + metadata only;
+  // the audio files themselves never leave the device, so restoring a backup
+  // on a library that doesn't have the same files by name will skip those bits).
   const exportPlaylists = () => {
-    const data = playlists.map((p) => ({ name: p.name, tracks: p.trackIds.map((id) => library.find((t) => t.id === id)?.name).filter(Boolean) }));
-    const blob = new Blob([JSON.stringify({ app: "Spool", exportedAt: new Date().toISOString(), playlists: data }, null, 2)], { type: "application/json" });
+    const nameOf = (id) => library.find((t) => t.id === id)?.name;
+    const playlistsOut = playlists.map((p) => ({ name: p.name, tracks: p.trackIds.map(nameOf).filter(Boolean) }));
+    const likedOut = likedIds.map(nameOf).filter(Boolean);
+    const tagsOut = {};
+    Object.entries(tagsMap).forEach(([id, tags]) => { const n = nameOf(id); if (n && tags?.length) tagsOut[n] = tags; });
+    const lyricsOut = {};
+    Object.entries(lyricsMap).forEach(([id, txt]) => { const n = nameOf(id); if (n && txt) lyricsOut[n] = txt; });
+    const playCountsOut = {};
+    Object.entries(playCounts).forEach(([id, count]) => { const n = nameOf(id); if (n && count) playCountsOut[n] = count; });
+
+    const payload = {
+      app: "Spool", version: 2, exportedAt: new Date().toISOString(),
+      playlists: playlistsOut, liked: likedOut, tags: tagsOut, lyrics: lyricsOut, playCounts: playCountsOut,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = "spool-playlists.json"; a.click();
+    a.href = url; a.download = `spool-backup-${new Date().toISOString().slice(0, 10)}.json`; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-    showToast("Playlists exported");
+    showToast("Backup exported");
   };
   const importPlaylistsFile = async (file) => {
     try {
       const text = await file.text();
       const data = JSON.parse(text);
+      const idByName = (name) => library.find((t) => t.name === name)?.id;
       let restored = 0, missing = 0;
+
       (data.playlists || []).forEach((p) => {
-        const ids = p.tracks.map((name) => library.find((t) => t.name === name)?.id).filter(Boolean);
+        const ids = p.tracks.map(idByName).filter(Boolean);
         missing += p.tracks.length - ids.length;
         if (ids.length) { setPlaylists((prev) => [...prev, { id: uid(), name: p.name, trackIds: ids }]); restored++; }
       });
+
+      if (Array.isArray(data.liked) && data.liked.length) {
+        const ids = data.liked.map(idByName).filter(Boolean);
+        if (ids.length) setLikedIds((prev) => Array.from(new Set([...prev, ...ids])));
+      }
+      if (data.tags && typeof data.tags === "object") {
+        setTagsMap((prev) => {
+          const next = { ...prev };
+          Object.entries(data.tags).forEach(([name, tags]) => { const id = idByName(name); if (id) next[id] = Array.from(new Set([...(next[id] || []), ...tags])); });
+          return next;
+        });
+      }
+      if (data.lyrics && typeof data.lyrics === "object") {
+        setLyricsMap((prev) => {
+          const next = { ...prev };
+          Object.entries(data.lyrics).forEach(([name, txt]) => { const id = idByName(name); if (id && !next[id]) next[id] = txt; });
+          return next;
+        });
+      }
+      if (data.playCounts && typeof data.playCounts === "object") {
+        setPlayCounts((prev) => {
+          const next = { ...prev };
+          Object.entries(data.playCounts).forEach(([name, count]) => { const id = idByName(name); if (id) next[id] = Math.max(next[id] || 0, count); });
+          return next;
+        });
+      }
+
       showToast(`Restored ${restored} playlist(s)${missing ? ` — ${missing} track(s) not found in your library` : ""}`);
     } catch { showToast("Couldn't read that backup file"); }
   };
@@ -1519,6 +2099,60 @@ export default function MusicPlayer() {
     } catch { showToast("Couldn't create the share card"); }
   };
 
+  // WOW — "Spool Wrapped": a shareable, Spotify-Wrapped-style stats card
+  // built from real listening data (reuses the weekly/lifetime stats already
+  // computed above), rendered to a PNG and shared or downloaded.
+  const shareWrappedCard = async () => {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = 600; canvas.height = 800;
+      const ctx2d = canvas.getContext("2d");
+      const grad = ctx2d.createLinearGradient(0, 0, 600, 800);
+      const topTrack = weeklyTop[0]?.track || mostPlayed[0];
+      const h1 = artHue(topTrack?.name || "Spool");
+      grad.addColorStop(0, `hsl(${h1} 70% 22%)`); grad.addColorStop(1, "#0A0A0A");
+      ctx2d.fillStyle = grad; ctx2d.fillRect(0, 0, 600, 800);
+
+      ctx2d.fillStyle = "rgba(255,255,255,0.55)"; ctx2d.font = "bold 20px sans-serif";
+      ctx2d.fillText("YOUR SPOOL WRAPPED", 40, 70);
+      ctx2d.fillStyle = "#fff"; ctx2d.font = "bold 44px sans-serif";
+      ctx2d.fillText(`${weeklyMinutes}`, 40, 150);
+      ctx2d.font = "20px sans-serif"; ctx2d.fillStyle = "rgba(255,255,255,0.7)";
+      ctx2d.fillText("minutes listened this week", 40, 180);
+
+      const stat = (label, value, y) => {
+        ctx2d.fillStyle = "#fff"; ctx2d.font = "bold 34px sans-serif"; ctx2d.fillText(`${value}`, 40, y);
+        ctx2d.fillStyle = "rgba(255,255,255,0.7)"; ctx2d.font = "16px sans-serif"; ctx2d.fillText(label, 40, y + 26);
+      };
+      stat("plays this week", weeklyPlays.length, 250);
+      stat("lifetime plays", totalLifetimePlays, 330);
+      stat("songs in your library", library.length, 410);
+      stat("liked songs", likedTracks.length, 490);
+
+      if (topTrack) {
+        ctx2d.fillStyle = "rgba(255,255,255,0.55)"; ctx2d.font = "16px sans-serif";
+        ctx2d.fillText("TOP TRACK", 40, 570);
+        ctx2d.fillStyle = "#fff"; ctx2d.font = "bold 26px sans-serif";
+        ctx2d.fillText(topTrack.name.slice(0, 26), 40, 605);
+      }
+
+      ctx2d.fillStyle = "rgba(255,255,255,0.45)"; ctx2d.font = "16px sans-serif";
+      ctx2d.fillText("Made with Spool 🎧", 40, 750);
+
+      canvas.toBlob(async (blob) => {
+        const file = new File([blob], "spool-wrapped.png", { type: "image/png" });
+        if (navigator.share && navigator.canShare?.({ files: [file] })) {
+          await navigator.share({ files: [file], title: "My Spool Wrapped" });
+        } else {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a"); a.href = url; a.download = "spool-wrapped.png"; a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 2000);
+        }
+      }, "image/png");
+      haptic(15);
+    } catch { showToast("Couldn't create the Wrapped card"); }
+  };
+
   const createPlaylist = () => {
     const name = newPlaylistName.trim();
     if (!name) return;
@@ -1534,14 +2168,29 @@ export default function MusicPlayer() {
   };
   const removeFromPlaylist = (playlistId, trackId) => {
     setPlaylists((prev) => prev.map((p) => (p.id === playlistId ? { ...p, trackIds: p.trackIds.filter((t) => t !== trackId) } : p)));
-    showToast("Removed from playlist");
+    haptic(10);
+    showUndoToast("Removed from playlist", () => {
+      setPlaylists((prev) => prev.map((p) => (p.id === playlistId && !p.trackIds.includes(trackId) ? { ...p, trackIds: [...p.trackIds, trackId] } : p)));
+      showToast("Restored");
+    });
   };
   const deleteFromLibrary = (trackId) => {
+    const track = library.find((t) => t.id === trackId);
+    const memberships = playlists.filter((p) => p.trackIds.includes(trackId)).map((p) => p.id);
     setLibrary((prev) => prev.filter((t) => t.id !== trackId));
     setPlaylists((prev) => prev.map((p) => ({ ...p, trackIds: p.trackIds.filter((t) => t !== trackId) })));
     setQueue((prev) => prev.filter((id) => id !== trackId));
     idbDeleteTrack(trackId);
-    showToast("Deleted");
+    haptic([10, 30, 10]);
+    if (!track) { showToast("Deleted"); return; }
+    showUndoToast("Deleted", async () => {
+      let artBlob = null;
+      try { if (track.artUrl) artBlob = await (await fetch(track.artUrl)).blob(); } catch { /* art may be gone, that's OK */ }
+      setLibrary((prev) => [track, ...prev]);
+      setPlaylists((prev) => prev.map((p) => (memberships.includes(p.id) ? { ...p, trackIds: [...p.trackIds, trackId] } : p)));
+      idbPutTrack({ id: track.id, name: track.name, ext: track.ext, duration: track.duration, peaks: track.peaks, addedAt: track.addedAt, blob: track.file, artBlob, trimStart: track.trimStart, trimEnd: track.trimEnd });
+      showToast("Restored");
+    });
   };
 
   // WOW — rename a track's display title (e.g. fix a messy filename)
@@ -1595,14 +2244,136 @@ export default function MusicPlayer() {
   const onSheetTouchStart = (e) => { touchStartY.current = e.touches[0].clientY; setDragging(true); };
   const onSheetTouchMove = (e) => { const dy = e.touches[0].clientY - touchStartY.current; if (dy > 0) setDragY(dy); };
   const onSheetTouchEnd = () => { setDragging(false); if (dragY > 110) setNowPlayingOpen(false); setDragY(0); };
-  const onArtTouchStart = (e) => { artTouchStartX.current = e.touches[0].clientX; };
-  const onArtTouchMove = (e) => { setArtSwipeX(e.touches[0].clientX - artTouchStartX.current); };
-  const onArtTouchEnd = () => { if (artSwipeX < -70) stepTrack(1); else if (artSwipeX > 70) stepTrack(-1); setArtSwipeX(0); };
+  const onArtTouchStart = (e) => {
+    artTouchStartX.current = e.touches[0].clientX;
+    artTouchStartY.current = e.touches[0].clientY;
+    artDraggedRef.current = false;
+  };
+  const onArtTouchMove = (e) => {
+    const dx = e.touches[0].clientX - artTouchStartX.current;
+    const dy = e.touches[0].clientY - artTouchStartY.current;
+    if (Math.abs(dx) > 8 || Math.abs(dy) > 8) artDraggedRef.current = true;
+    if (!artFlipped) { setArtSwipeX(dx); setArtSwipeY(Math.max(-60, Math.min(60, dy))); }
+  };
+  // GOD-LEVEL — Instagram-style double-tap-to-like: a single tap still flips
+  // the art (after a short grace period to see if a second tap follows); a
+  // second tap inside that window instead fires a heart burst and likes the
+  // track (never unlikes on double-tap, matching the familiar convention).
+  const triggerHeartBurst = () => {
+    if (!currentTrack) return;
+    haptic([10, 30, 10]);
+    if (!likedIds.includes(currentTrack.id)) toggleLike(currentTrack.id);
+    setHeartBurstKey((k) => k + 1);
+    setShowHeartBurst(true);
+    setTimeout(() => setShowHeartBurst(false), 750);
+  };
+  const onArtTouchEnd = () => {
+    if (!artDraggedRef.current) {
+      const now = Date.now();
+      if (now - lastArtTapRef.current < 300) {
+        clearTimeout(singleTapTimeoutRef.current);
+        lastArtTapRef.current = 0;
+        triggerHeartBurst();
+      } else {
+        lastArtTapRef.current = now;
+        singleTapTimeoutRef.current = setTimeout(() => { haptic(12); setArtFlipped((f) => !f); }, 260);
+      }
+      setArtSwipeX(0); setArtSwipeY(0);
+      return;
+    }
+    if (!artFlipped) { if (artSwipeX < -70) stepTrack(1); else if (artSwipeX > 70) stepTrack(-1); }
+    setArtSwipeX(0); setArtSwipeY(0);
+  };
+
+  // WOW — floating draggable "bubble" mini-player (opt-in via Settings):
+  // an in-app chat-head-style bubble that can be dragged anywhere on screen
+  // and tapped to reopen Now Playing — works even where system Picture-in-
+  // Picture isn't supported.
+  const onBubbleTouchStart = (e) => {
+    bubbleDraggedRef.current = false;
+    bubbleDragRef.current = { startX: e.touches[0].clientX, startY: e.touches[0].clientY, origX: bubblePos.x, origY: bubblePos.y };
+  };
+  const onBubbleTouchMove = (e) => {
+    if (!bubbleDragRef.current) return;
+    const dx = e.touches[0].clientX - bubbleDragRef.current.startX, dy = e.touches[0].clientY - bubbleDragRef.current.startY;
+    if (Math.abs(dx) > 6 || Math.abs(dy) > 6) bubbleDraggedRef.current = true;
+    const nx = Math.max(8, Math.min(window.innerWidth - 72, bubbleDragRef.current.origX + dx));
+    const ny = Math.max(60, Math.min(window.innerHeight - 150, bubbleDragRef.current.origY + dy));
+    setBubblePos({ x: nx, y: ny });
+  };
+  const onBubbleTouchEnd = () => {
+    bubbleDragRef.current = null;
+    if (!bubbleDraggedRef.current) { haptic(10); setNowPlayingOpen(true); }
+  };
+
+  // GOD-LEVEL — swipe up/down on the edge of Now Playing to adjust volume,
+  // with a live HUD ring so you can see the level without looking at the
+  // slider. Kept to a dedicated edge strip so it never fights the album
+  // art's own left/right swipe-to-skip or the sheet's drag-to-close.
+  const onVolumeGestureStart = (e) => {
+    if (!gestureVolumeEnabled) return;
+    e.stopPropagation();
+    volumeGestureRef.current = { startY: e.touches[0].clientY, startVol: muted ? 0 : volume };
+    setVolumeHUD(muted ? 0 : volume);
+  };
+  const onVolumeGestureMove = (e) => {
+    if (!gestureVolumeEnabled || !volumeGestureRef.current) return;
+    e.stopPropagation();
+    const dy = volumeGestureRef.current.startY - e.touches[0].clientY;
+    const nextVol = Math.max(0, Math.min(1, volumeGestureRef.current.startVol + dy / 180));
+    setVolume(nextVol);
+    setMuted(false);
+    setVolumeHUD(nextVol);
+  };
+  const onVolumeGestureEnd = (e) => {
+    if (!gestureVolumeEnabled) return;
+    e.stopPropagation();
+    volumeGestureRef.current = null;
+    setTimeout(() => setVolumeHUD(null), 450);
+  };
+
+  // GOD-LEVEL — voice control ("Hey Spool, play/pause/next/previous/shuffle")
+  // via the Web Speech API. Falls back gracefully (button just won't do
+  // anything useful) on browsers without SpeechRecognition support.
+  const toggleVoiceControl = () => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { showToast("Voice control isn't supported on this browser"); return; }
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+      setVoiceListening(false);
+      return;
+    }
+    const rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = false;
+    rec.lang = "en-IN";
+    rec.onstart = () => setVoiceListening(true);
+    rec.onend = () => { setVoiceListening(false); if (recognitionRef.current === rec) recognitionRef.current = null; };
+    rec.onerror = () => { setVoiceListening(false); };
+    rec.onresult = (ev) => {
+      const heard = ev.results[ev.results.length - 1][0].transcript.toLowerCase().trim();
+      setVoiceHeard(heard);
+      if (/pause|stop/.test(heard)) { if (isPlaying) togglePlay(); }
+      else if (/play|resume|start/.test(heard)) { if (!isPlaying) togglePlay(); }
+      else if (/next|skip/.test(heard)) stepTrack(1);
+      else if (/previous|back|last song/.test(heard)) stepTrack(-1);
+      else if (/shuffle/.test(heard)) setShuffle((s) => !s);
+      else if (/like|love this/.test(heard)) toggleLike(currentTrack?.id);
+      else if (/louder|volume up/.test(heard)) setVolume((v) => Math.min(1, v + 0.15));
+      else if (/quieter|volume down/.test(heard)) setVolume((v) => Math.max(0, v - 0.15));
+    };
+    try { rec.start(); recognitionRef.current = rec; } catch {}
+  };
+  useEffect(() => () => { try { recognitionRef.current?.stop(); } catch {} }, []);
 
   const q = searchQuery.trim().toLowerCase();
-  const searchLibraryResults = q ? library.filter((t) => t.name.toLowerCase().includes(q)) : [];
+  // WOW — search now also matches a track's tags (e.g. "workout", "chill"),
+  // not just the file name, so tagging songs actually pays off in Search.
+  const trackMatchesQuery = (t) => t.name.toLowerCase().includes(q) || (tagsMap[t.id] || []).some((tag) => tag.toLowerCase().includes(q));
+  const searchLibraryResults = q ? library.filter(trackMatchesQuery) : [];
   const searchPlaylistResults = q
-    ? playlists.map((p) => ({ playlist: p, tracks: p.trackIds.map((id) => library.find((t) => t.id === id)).filter((t) => t && t.name.toLowerCase().includes(q)) })).filter((r) => r.tracks.length > 0)
+    ? playlists.map((p) => ({ playlist: p, tracks: p.trackIds.map((id) => library.find((t) => t.id === id)).filter((t) => t && trackMatchesQuery(t)) })).filter((r) => r.tracks.length > 0)
     : [];
 
   const openContext = (trackId, mode, playlistId = null) => { setContextTrackId(trackId); setContextInfo({ mode, playlistId }); };
@@ -1644,13 +2415,13 @@ export default function MusicPlayer() {
           .np-player-body .np-controls-col { width: auto; max-width: 360px; }
         }
 
-        /* ---- Liquid Glass system ---- */
+        /* ---- Liquid Glass system (v2 — deeper refraction + drifting shimmer) ---- */
         .glass {
           background: rgba(255,255,255,0.07);
-          backdrop-filter: blur(28px) saturate(190%);
-          -webkit-backdrop-filter: blur(28px) saturate(190%);
-          border: 1px solid rgba(255,255,255,0.14);
-          box-shadow: 0 10px 34px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.18), inset 0 -10px 20px -12px rgba(0,0,0,0.25);
+          backdrop-filter: blur(30px) saturate(200%);
+          -webkit-backdrop-filter: blur(30px) saturate(200%);
+          border: 1px solid rgba(255,255,255,0.16);
+          box-shadow: 0 12px 38px rgba(0,0,0,0.42), inset 0 1px 0 rgba(255,255,255,0.22), inset 0 -12px 22px -14px rgba(0,0,0,0.3), inset 0 0 0 1px rgba(255,255,255,0.04);
           position: relative;
         }
         .glass-light {
@@ -1660,11 +2431,14 @@ export default function MusicPlayer() {
         }
         .glass::before {
           content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
-          background: linear-gradient(120deg, rgba(255,255,255,0.16) 0%, rgba(255,255,255,0.02) 32%, transparent 55%);
+          background: linear-gradient(125deg, rgba(255,255,255,0.20) 0%, rgba(255,255,255,0.03) 30%, transparent 50%, rgba(255,255,255,0.07) 75%, transparent 100%);
+          background-size: 240% 240%;
+          animation: glassDrift 10s ease-in-out infinite;
         }
+        @keyframes glassDrift { 0%, 100% { background-position: 0% 0%; } 50% { background-position: 100% 65%; } }
         .glass-tile {
           position: relative; overflow: hidden;
-          box-shadow: 0 6px 16px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.25), inset 0 -6px 12px -8px rgba(0,0,0,0.5);
+          box-shadow: 0 8px 20px rgba(0,0,0,0.48), inset 0 1px 0 rgba(255,255,255,0.28), inset 0 -8px 14px -9px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(255,255,255,0.05);
           transform: translateZ(0);
         }
         .glass-tile::after {
@@ -1678,8 +2452,30 @@ export default function MusicPlayer() {
           border: 1px solid rgba(255,255,255,0.14);
           box-shadow: inset 0 1px 0 rgba(255,255,255,0.2), 0 4px 10px rgba(0,0,0,0.25);
         }
+        /* Real 3D press physics — every .press / .press-3d element now tips
+           into the screen on tap (perspective + rotateX) instead of just
+           scaling, so taps throughout the whole app feel physically 3D. */
+        .press { transition: transform 0.15s cubic-bezier(0.32,0.72,0,1), filter 0.15s, box-shadow 0.15s; transform-style: preserve-3d; }
+        .press:active { transform: perspective(400px) rotateX(10deg) scale(0.93) translateY(1px); filter: brightness(0.94); box-shadow: 0 2px 6px rgba(0,0,0,0.3); }
         .press-3d { transform-style: preserve-3d; transition: transform 0.16s cubic-bezier(0.32,0.72,0,1), box-shadow 0.16s; }
-        .press-3d:active { transform: scale(0.93) translateY(1px); box-shadow: 0 2px 6px rgba(0,0,0,0.3); }
+        .press-3d:active { transform: perspective(400px) rotateX(10deg) scale(0.93) translateY(1px); box-shadow: 0 2px 6px rgba(0,0,0,0.3); }
+        /* GOD-LEVEL — Focus/Meditation mode breathing guide (4-7-8 pattern) */
+        .god-breathe-circle { animation: godBreathe 19s ease-in-out infinite; }
+        @keyframes godBreathe {
+          0% { transform: scale(0.62); opacity: 0.55; }
+          21% { transform: scale(1); opacity: 0.95; }
+          58% { transform: scale(1); opacity: 0.95; }
+          100% { transform: scale(0.62); opacity: 0.55; }
+        }
+
+        /* GOD-LEVEL — double-tap-to-like heart burst */
+        .god-heart-pop { animation: godHeartPop 0.7s cubic-bezier(0.2,1.4,0.4,1) forwards; }
+        @keyframes godHeartPop { 0% { transform: scale(0.3); opacity: 0; } 30% { transform: scale(1.25); opacity: 1; } 60% { transform: scale(1); opacity: 1; } 100% { transform: scale(1.1); opacity: 0; } }
+
+        /* GOD-LEVEL — voice control listening pulse */
+        .god-voice-pulse { animation: godVoicePulse 1.1s ease-in-out infinite; }
+        @keyframes godVoicePulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(250,45,72,0.5); } 50% { box-shadow: 0 0 0 10px rgba(250,45,72,0); } }
+
         .shine-sweep { position: relative; overflow: hidden; }
         .shine-sweep::after {
           content: ""; position: absolute; top: -60%; left: -60%; width: 40%; height: 220%;
@@ -1690,6 +2486,12 @@ export default function MusicPlayer() {
       `}</style>
 
       {toast && <div className="fade-in absolute top-3 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs font-medium" style={{ background: "rgba(40,40,42,0.95)", zIndex: 70, backdropFilter: "blur(20px)" }}>{toast}</div>}
+      {lastDeleted && (
+        <div className="fade-in absolute top-3 left-1/2 -translate-x-1/2 flex items-center gap-3 pl-4 pr-2 py-2 rounded-full text-xs font-medium" style={{ background: "rgba(40,40,42,0.95)", zIndex: 71, backdropFilter: "blur(20px)" }}>
+          <span>{lastDeleted.message}</span>
+          <button onClick={() => { lastDeleted.onUndo(); setLastDeleted(null); haptic(10); }} className="press px-3 py-1 rounded-full font-semibold" style={{ background: "#FA2D48", color: "#fff" }}>Undo</button>
+        </div>
+      )}
 
       <header className="flex items-center justify-between px-4 shrink-0" style={{ height: 54, background: palette.bg, color: palette.text }}>
         <h1 className="text-2xl font-extrabold tracking-tight">{activeTab === "home" ? "Home" : activeTab === "library" ? (openPlaylistId ? "" : "Library") : "Search"}</h1>
@@ -1731,6 +2533,8 @@ export default function MusicPlayer() {
                 {likedTracks.length > 0 && <HomeRow title="Favorites" icon={<Heart size={14} />} tracks={likedTracks} onPlay={(i) => playFrom(likedTracks, i, "Favorites")} />}
                 {recentlyPlayedTracks.length > 0 && <HomeRow title="Recently Played" icon={<Clock size={14} />} tracks={recentlyPlayedTracks} onPlay={(i) => playFrom(recentlyPlayedTracks, i, "Recently Played")} />}
                 {mostPlayed.length > 0 && <HomeRow title="Most Played" icon={<TrendingUp size={14} />} tracks={mostPlayed} onPlay={(i) => playFrom(mostPlayed, i, "Most Played")} />}
+                {discoverAgain.length > 0 && <HomeRow title="Discover Again" icon={<Sparkles size={14} />} tracks={discoverAgain} onPlay={(i) => playFrom(discoverAgain, i, "Discover Again")} />}
+                {timeMixTracks.length > 0 && <HomeRow title={timeMixLabel} icon={<Moon size={14} />} tracks={timeMixTracks} onPlay={(i) => playFrom(timeMixTracks, i, timeMixLabel)} />}
                 {playlists.length > 0 && (
                   <div>
                     <div className="text-lg font-bold mb-3">Your Playlists</div>
@@ -1835,7 +2639,7 @@ export default function MusicPlayer() {
           <div className="pt-1">
             <div className={`glass-pill flex items-center gap-2 px-3 py-2.5 rounded-xl mb-4 ${theme === "light" ? "glass-light" : ""}`} style={{ background: palette.surface }}>
               <Search size={15} color={palette.subtext} />
-              <input autoFocus value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Artists, Songs, Playlists" className="bg-transparent outline-none text-sm flex-1" style={{ color: palette.text }} />
+              <input autoFocus value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Artists, Songs, Playlists" aria-label="Search your library" className="bg-transparent outline-none text-sm flex-1" style={{ color: palette.text }} />
               {searchQuery && <button onClick={() => setSearchQuery("")} className="press p-1"><X size={15} color={palette.subtext} /></button>}
             </div>
             {!q ? (<div className="text-sm text-center py-16" style={{ color: palette.subtext }}>Search your library and playlists</div>) : (
@@ -1860,7 +2664,7 @@ export default function MusicPlayer() {
       </main>
 
       <div className="absolute left-0 right-0 bottom-0 flex flex-col" style={{ zIndex: 20 }}>
-        {currentTrack && !nowPlayingOpen && !selectMode && (
+        {currentTrack && !nowPlayingOpen && !selectMode && !bubbleMode && (
           <div onClick={() => setNowPlayingOpen(true)} className={`glass press press-3d mx-2 mb-2 flex items-center gap-3 px-3 rounded-2xl fade-in shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 60, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)", boxShadow: "0 4px 14px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.18)" }}>
             <ArtBox track={currentTrack} className="w-9 h-9 rounded-lg shrink-0" />
             <div className="flex-1 min-w-0 text-left"><div className="text-sm font-medium truncate">{currentTrack.name}</div></div>
@@ -1871,25 +2675,47 @@ export default function MusicPlayer() {
         )}
 
         {selectMode && (
-          <div className={`glass mx-2 mb-2 flex items-center gap-2 px-3 rounded-2xl fade-in shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 60, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)" }}>
-            <button onClick={clearSelection} className="press p-2"><X size={20} /></button>
-            <span className="text-sm font-medium flex-1">{selectedIds.length} selected</span>
-            <button onClick={bulkPlay} disabled={!selectedIds.length} className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><Play size={20} fill="#fff" /></button>
-            <button onClick={() => setBulkAddSheetOpen(true)} disabled={!selectedIds.length} className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><ListPlus size={20} /></button>
-            <button onClick={bulkDelete} disabled={!selectedIds.length} className="press p-2" style={{ color: "#FF453A", opacity: selectedIds.length ? 1 : 0.35 }}><Trash2 size={20} /></button>
+          <div role="toolbar" aria-label="Selection actions" className={`glass mx-2 mb-2 flex items-center gap-2 px-3 rounded-2xl fade-in shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 60, border: theme === "light" ? undefined : "1px solid rgba(255,255,255,0.16)" }}>
+            <button onClick={clearSelection} aria-label="Clear selection" className="press p-2"><X size={20} /></button>
+            <span className="text-sm font-medium flex-1" aria-live="polite">{selectedIds.length} selected</span>
+            <button onClick={bulkPlay} disabled={!selectedIds.length} aria-label="Play selected" className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><Play size={20} fill="#fff" /></button>
+            <button onClick={() => setBulkAddSheetOpen(true)} disabled={!selectedIds.length} aria-label="Add selected to playlist" className="press p-2" style={{ opacity: selectedIds.length ? 1 : 0.35 }}><ListPlus size={20} /></button>
+            <button onClick={bulkDelete} disabled={!selectedIds.length} aria-label="Delete selected" className="press p-2" style={{ color: "#FF453A", opacity: selectedIds.length ? 1 : 0.35 }}><Trash2 size={20} /></button>
           </div>
         )}
 
-        <nav className={`glass flex items-stretch shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 66, border: "none", borderTop: `1px solid ${theme === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.1)"}`, boxShadow: "none" }}>
+        <nav aria-label="Main" className={`glass flex items-stretch shrink-0 ${theme === "light" ? "glass-light" : ""}`} style={{ height: 66, border: "none", borderTop: `1px solid ${theme === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.1)"}`, boxShadow: "none" }}>
           {[["home", "Home", <Home size={22} />], ["library", "Library", <LibraryIcon size={22} />], ["search", "Search", <Search size={22} />]].map(([key, label, icon]) => (
-            <button key={key} onClick={() => { setActiveTab(key); if (key !== "library") setOpenPlaylistId(null); clearSelection(); }} className="press flex-1 flex flex-col items-center justify-center gap-1" style={{ color: activeTab === key ? "#FA2D48" : "#98989D" }}>{icon}<span className="text-[10px] font-medium">{label}</span></button>
+            <button key={key} onClick={() => { setActiveTab(key); if (key !== "library") setOpenPlaylistId(null); clearSelection(); }} aria-label={label} aria-current={activeTab === key ? "page" : undefined} className="press flex-1 flex flex-col items-center justify-center gap-1" style={{ color: activeTab === key ? "#FA2D48" : "#98989D" }}>{icon}<span className="text-[10px] font-medium">{label}</span></button>
           ))}
         </nav>
       </div>
 
+      {bubbleMode && currentTrack && !nowPlayingOpen && !selectMode && (
+        <div
+          onTouchStart={onBubbleTouchStart} onTouchMove={onBubbleTouchMove} onTouchEnd={onBubbleTouchEnd}
+          className="glass press-3d fixed rounded-full fade-in"
+          style={{ left: bubblePos.x, top: bubblePos.y, width: 64, height: 64, zIndex: 65, touchAction: "none", border: "1px solid rgba(255,255,255,0.25)", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" }}
+        >
+          <ArtBox track={currentTrack} className="w-full h-full rounded-full overflow-hidden flex items-center justify-center">
+            {!currentTrack.artUrl && <Disc3 size={26} color="rgba(255,255,255,0.6)" />}
+          </ArtBox>
+          {isPlaying && (
+            <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 flex items-end gap-0.5 h-3 px-1.5 py-0.5 rounded-full" style={{ background: "rgba(0,0,0,0.7)" }}>
+              <div className="eq-bar" style={{ animationDelay: "0s", width: 2 }} /><div className="eq-bar" style={{ animationDelay: "0.2s", width: 2 }} /><div className="eq-bar" style={{ animationDelay: "0.4s", width: 2 }} />
+            </div>
+          )}
+        </div>
+      )}
+
       {nowPlayingOpen && currentTrack && (() => {
         const paperMode = vinylMode && npView === "player";
         const PAPER_BG = "#EDE7DC";
+        // WOW — real 3D tilt: dragging the album art tips it in 3D space
+        // (perspective + rotateX/rotateY), and a tap flips it over to a
+        // glass info card. Disabled while flipped so the back face stays put.
+        const dragTiltY = !artFlipped ? Math.max(-16, Math.min(16, artSwipeX / 6)) : 0;
+        const dragTiltX = !artFlipped ? Math.max(-14, Math.min(14, -artSwipeY / 6)) : 0;
         return (
         <div className="sheet-enter absolute inset-0 flex flex-col overflow-hidden" style={{ zIndex: 60, transform: `translateY(${dragY}px)`, transition: dragging ? "none" : `transform 0.3s ${SPRING}` }}>
           <div className="absolute inset-0" style={{ background: paperMode ? PAPER_BG : "#0A0A0A", transition: "background 0.4s ease" }} />
@@ -1897,6 +2723,14 @@ export default function MusicPlayer() {
           <div className="absolute inset-0" style={{ background: paperMode ? "transparent" : "linear-gradient(180deg, transparent, rgba(0,0,0,0.6) 55%, #0A0A0A 90%)" }} />
 
           <div className="relative flex flex-col h-full" onTouchStart={onSheetTouchStart} onTouchMove={onSheetTouchMove} onTouchEnd={onSheetTouchEnd}>
+            {gestureVolumeEnabled && npView === "player" && (
+              <div
+                onTouchStart={onVolumeGestureStart} onTouchMove={onVolumeGestureMove} onTouchEnd={onVolumeGestureEnd}
+                className="absolute right-0 top-[10%] w-14"
+                style={{ zIndex: 15, height: "40%", touchAction: "none" }}
+                aria-hidden="true"
+              />
+            )}
             <div className="flex flex-col items-center pt-2 pb-1 shrink-0"><div className="w-9 h-1 rounded-full" style={{ background: paperMode ? "rgba(28,27,23,0.22)" : "rgba(255,255,255,0.35)" }} /></div>
             <div className="flex items-center justify-between px-5 shrink-0" style={{ height: 44, color: paperMode ? "#1C1B17" : "#FFFFFF" }}>
               <button onClick={() => setNowPlayingOpen(false)} className="press p-1"><ChevronDown size={22} color={paperMode ? "#1C1B17" : "#FFFFFF"} /></button>
@@ -1904,6 +2738,7 @@ export default function MusicPlayer() {
               <div className="flex items-center gap-3">
                 <button onClick={() => setVinylMode((v) => !v)} className="press p-1"><Disc3 size={19} color={vinylMode ? accent : paperMode ? "#1C1B17" : "#FFFFFF"} /></button>
                 {vinylMode && <button onClick={() => setCrackleEnabled((c) => !c)} className="press p-1" title="Vinyl crackle"><Waves size={18} color={crackleEnabled ? accent : paperMode ? "#1C1B17" : "#FFFFFF"} /></button>}
+                <button onClick={() => setShowExperienceSheet(true)} className="press p-1" aria-label="Experience"><Sparkles size={18} color={paperMode ? "#1C1B17" : "#FFFFFF"} /></button>
                 <button onClick={startFloatingPlayer} className="press p-1"><PictureInPicture2 size={17} color={paperMode ? "#1C1B17" : "#FFFFFF"} /></button>
                 <button onClick={() => toggleLike(currentTrack.id)} className="press p-1"><Heart size={19} color={likedIds.includes(currentTrack.id) ? accent : (paperMode ? "#1C1B17" : "#FFFFFF")} fill={likedIds.includes(currentTrack.id) ? accent : "none"} /></button>
                 <button onClick={() => setInfoSheetTrackId(currentTrack.id)} className="press p-1"><Info size={19} color={paperMode ? "#1C1B17" : "#FFFFFF"} /></button>
@@ -1934,7 +2769,8 @@ export default function MusicPlayer() {
               />
             ) : (
               <div className="np-player-body flex-1 flex flex-col items-center justify-center px-8 gap-6 overflow-y-auto">
-                <div className="np-art w-full max-w-xs aspect-square rounded-2xl overflow-hidden shadow-2xl" onTouchStart={vinylMode ? undefined : onArtTouchStart} onTouchMove={vinylMode ? undefined : onArtTouchMove} onTouchEnd={vinylMode ? undefined : onArtTouchEnd}
+                <div ref={beatPulseElRef} className="w-full max-w-xs" style={{ transformOrigin: "center" }}>
+                <div className="np-art w-full aspect-square rounded-2xl overflow-hidden shadow-2xl relative" onTouchStart={vinylMode ? undefined : onArtTouchStart} onTouchMove={vinylMode ? undefined : onArtTouchMove} onTouchEnd={vinylMode ? undefined : onArtTouchEnd}
                   style={{ transform: `translateX(${artSwipeX}px)`, transition: artSwipeX === 0 ? `transform 0.25s ${SPRING}` : "none" }}>
                   {vinylMode ? (() => {
                     const vc = VINYL_COLORS[vinylColor] || VINYL_COLORS.classic;
@@ -2067,10 +2903,32 @@ export default function MusicPlayer() {
                       </div>
                     );
                   })() : (
-                    <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">
-                      {!currentTrack.artUrl && <Disc3 size={70} color="rgba(255,255,255,0.55)" className={isPlaying ? "animate-spin" : ""} style={{ animationDuration: "4s" }} />}
-                    </ArtBox>
+                    <div className="w-full h-full" style={{ perspective: 1200 }}>
+                      <div className="relative w-full h-full rounded-2xl" style={{
+                        transformStyle: "preserve-3d",
+                        transform: `rotateX(${dragTiltX}deg) rotateY(${(artFlipped ? 180 : 0) + dragTiltY}deg)`,
+                        transition: artSwipeX === 0 && artSwipeY === 0 ? `transform 0.6s cubic-bezier(0.34,1.56,0.64,1)` : "none",
+                      }}>
+                        <div className="absolute inset-0 rounded-2xl overflow-hidden" style={{ backfaceVisibility: "hidden" }}>
+                          <ArtBox track={currentTrack} className="w-full h-full flex items-center justify-center">
+                            {!currentTrack.artUrl && <Disc3 size={70} color="rgba(255,255,255,0.55)" className={isPlaying ? "animate-spin" : ""} style={{ animationDuration: "4s" }} />}
+                          </ArtBox>
+                          {/* specular glare that slides opposite the tilt — sells the glass/3D feel */}
+                          <div className="absolute inset-0 pointer-events-none" style={{ background: `radial-gradient(circle at ${50 - dragTiltY * 2.2}% ${50 + dragTiltX * 2.2}%, rgba(255,255,255,0.22), transparent 55%)` }} />
+                          {showBurst && <AlbumBurst burstKey={burstKey} accent={accent} />}
+                        </div>
+                        <div className="absolute inset-0 rounded-2xl overflow-hidden glass flex flex-col items-center justify-center gap-2 px-6 text-center" style={{ backfaceVisibility: "hidden", transform: "rotateY(180deg)", background: "rgba(20,20,22,0.92)" }}>
+                          <Music size={30} color={accent} />
+                          <div className="text-lg font-bold px-2">{currentTrack.name}</div>
+                          <div className="text-xs" style={{ color: "#98989D" }}>{currentTrack.ext}{currentTrack.duration ? ` · ${fmtTime(currentTrack.duration)}` : ""}</div>
+                          <div className="text-xs" style={{ color: "#98989D" }}>Played {playCounts[currentTrack.id] || 0}×{likedIds.includes(currentTrack.id) ? " · Liked" : ""}</div>
+                          <div className="text-[10px] mt-2" style={{ color: "#6E6E73" }}>Tap to flip back</div>
+                        </div>
+                      </div>
+                    </div>
                   )}
+                  {showHeartBurst && <HeartBurst burstKey={heartBurstKey} accent={accent} />}
+                </div>
                 </div>
 
                 <div className="np-controls-col flex flex-col items-center gap-6 w-full">
@@ -2193,11 +3051,108 @@ export default function MusicPlayer() {
               </div>
             )}
 
-            {npView === "lyrics" && <LyricsPanel track={currentTrack} text={lyricsMap[currentTrack.id] || ""} onSave={(text) => setLyricsMap((prev) => ({ ...prev, [currentTrack.id]: text }))} onBack={() => setNpView("player")} />}
+            {npView === "lyrics" && <LyricsPanel track={currentTrack} text={lyricsMap[currentTrack.id] || ""} onSave={(text) => setLyricsMap((prev) => ({ ...prev, [currentTrack.id]: text }))} onBack={() => setNpView("player")} currentTime={currentTime} isPlaying={isPlaying} togglePlay={togglePlay} accent={accent} />}
           </div>
         </div>
         );
       })()}
+
+      {/* GOD-LEVEL — full-screen reactive visualizer */}
+      {showVisualizer && currentTrack && (
+        <div className="fixed inset-0 flex flex-col fade-in" style={{ zIndex: 95, background: "#000" }}>
+          <canvas ref={visualizerCanvasRef} className="absolute inset-0 w-full h-full" />
+          <div className="absolute inset-0 flex flex-col justify-between p-5" style={{ background: "linear-gradient(180deg, rgba(0,0,0,0.55), transparent 20%, transparent 78%, rgba(0,0,0,0.55))" }}>
+            <div className="flex items-center justify-between">
+              <button onClick={() => setShowVisualizer(false)} className="press p-2 rounded-full" style={{ background: "rgba(255,255,255,0.14)" }}><ChevronDown size={20} color="#fff" /></button>
+              <div className="flex gap-2">
+                {["particles", "rings", "bars3d"].map((s) => (
+                  <button key={s} onClick={() => setVisualizerStyle(s)} className="press px-3 py-1.5 rounded-full text-[11px] font-semibold capitalize" style={{ background: visualizerStyle === s ? accent : "rgba(255,255,255,0.14)", color: "#fff" }}>{s}</button>
+                ))}
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="text-white text-base font-bold truncate px-8">{currentTrack.name}</div>
+              <div className="text-white/60 text-xs mt-1">{isPlaying ? "Now playing" : "Paused"}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* GOD-LEVEL — ambient "live wallpaper" now-playing screen, styled like
+          a lock screen you'd cast to a second display or just let idle. */}
+      {liveWallpaperOpen && currentTrack && (
+        <LiveWallpaper track={currentTrack} isPlaying={isPlaying} accent={accent} themeColor={themeColor}
+          currentTime={currentTime} duration={duration} onClose={() => setLiveWallpaperOpen(false)}
+          togglePlay={togglePlay} stepTrack={stepTrack} />
+      )}
+
+      {/* GOD-LEVEL — Focus / Meditation mode: dims everything to a single
+          breathing guide synced loosely to a calm 4-7-8 pattern. */}
+      {focusModeOpen && currentTrack && (
+        <div className="fixed inset-0 flex flex-col items-center justify-center fade-in px-8 text-center" style={{ zIndex: 96, background: "rgba(0,0,0,0.94)" }}>
+          <button onClick={() => setFocusModeOpen(false)} className="press absolute top-6 right-6 p-2 rounded-full" style={{ background: "rgba(255,255,255,0.12)" }}><X size={20} color="#fff" /></button>
+          <div className="god-breathe-circle rounded-full" style={{ width: 180, height: 180, background: `radial-gradient(circle, ${accent}, transparent 72%)` }} />
+          <div className="text-white/50 text-xs mt-10 tracking-[0.2em]">BREATHE WITH THE MUSIC</div>
+          <div className="text-white text-base font-semibold mt-2">{currentTrack.name}</div>
+          <button onClick={togglePlay} className="press mt-8 w-14 h-14 rounded-full flex items-center justify-center" style={{ background: "rgba(255,255,255,0.14)" }}>{isPlaying ? <Pause size={22} color="#fff" /> : <Play size={22} color="#fff" style={{ marginLeft: 2 }} />}</button>
+        </div>
+      )}
+
+      {/* GOD-LEVEL — cinematic full-screen karaoke with word-by-word highlight */}
+      {cinematicKaraokeOpen && currentTrack && (
+        <CinematicKaraoke track={currentTrack} lyricsText={lyricsMap[currentTrack.id] || ""} currentTime={currentTime} accent={accent} onClose={() => setCinematicKaraokeOpen(false)} />
+      )}
+
+      {/* GOD-LEVEL — swipe-volume HUD */}
+      {volumeHUD != null && (
+        <div className="fixed inset-0 flex items-center justify-center pointer-events-none fade-in" style={{ zIndex: 97 }}>
+          <div className="glass rounded-2xl px-7 py-6 flex flex-col items-center gap-3">
+            {volumeHUD === 0 ? <VolumeX size={30} color="#fff" /> : <Volume2 size={30} color="#fff" />}
+            <div style={{ width: 120, height: 6, borderRadius: 3, background: "rgba(255,255,255,0.2)", overflow: "hidden" }}>
+              <div style={{ width: `${volumeHUD * 100}%`, height: "100%", background: accent, transition: "width 0.05s linear" }} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* GOD-LEVEL — voice control listening indicator */}
+      {voiceListening && (
+        <div className="fixed top-4 left-1/2 flex items-center gap-2 px-4 py-2 rounded-full god-voice-pulse fade-in" style={{ zIndex: 98, background: "rgba(250,45,72,0.92)", transform: "translateX(-50%)" }}>
+          <Mic2 size={14} color="#fff" /><span className="text-xs text-white font-medium">{voiceHeard || "Listening…"}</span>
+        </div>
+      )}
+
+      {/* GOD-LEVEL — Experience hub: one place to switch on every new
+          immersive feature without cluttering the rest of the app's UI. */}
+      {showExperienceSheet && (
+        <BottomSheetBackdrop bg={sheetBg} onClose={() => setShowExperienceSheet(false)}>
+          <SheetHandle />
+          <div className="px-5 pb-2 flex items-center gap-2"><Sparkles size={16} color={accent} /><span className="text-sm font-semibold">Experience</span></div>
+          <div className="px-5 pb-2 max-h-[60vh] overflow-y-auto">
+            <div className="text-[11px] tracking-widest mb-1" style={{ color: palette.subtext }}>VISUAL</div>
+            <SheetAction icon={<Sparkles size={17} />} label="Full-screen visualizer" sub={showVisualizer ? "On" : "Tap to open"} onClick={() => { setShowExperienceSheet(false); setShowVisualizer(true); }} />
+            <SettingRow label="Beat-synced pulse" sub="Album art thumps on the beat" value={beatPulseEnabled} onChange={() => setBeatPulseEnabled((v) => !v)} palette={palette} />
+            <SettingRow label="Morphing background" sub="Now Playing backdrop drifts & shifts hue" value={morphBgEnabled} onChange={() => setMorphBgEnabled((v) => !v)} palette={palette} />
+            <SheetAction icon={<Mic2 size={17} />} label="Cinematic karaoke" sub="Full-screen, word-by-word" onClick={() => { setShowExperienceSheet(false); setCinematicKaraokeOpen(true); }} />
+            <SheetAction icon={<Disc3 size={17} />} label="Live wallpaper" sub="Ambient now-playing screen" onClick={() => { setShowExperienceSheet(false); setLiveWallpaperOpen(true); }} />
+
+            <div className="text-[11px] tracking-widest mb-1 mt-4" style={{ color: palette.subtext }}>AUDIO</div>
+            <SettingRow label="8D spatial audio" sub="Sound orbits around your head" value={spatialAudioEnabled} onChange={() => setSpatialAudioEnabled((v) => !v)} palette={palette} />
+            <div className="flex gap-2 py-2">
+              {["off", "bedroom", "hall", "arena"].map((r) => (
+                <button key={r} onClick={() => setReverbRoom(r)} className="press flex-1 py-2 rounded-lg text-xs font-medium capitalize" style={{ background: reverbRoom === r ? accent : palette.surface, color: reverbRoom === r ? "#fff" : palette.subtext }}>{r === "off" ? "No Reverb" : r}</button>
+              ))}
+            </div>
+            <SettingRow label="Voice control" sub={voiceListening ? "Listening…" : 'Say "play", "next", "shuffle"…'} value={voiceListening} onChange={toggleVoiceControl} palette={palette} />
+            <SettingRow label="Swipe-volume gesture" sub="Swipe the right edge to adjust volume" value={gestureVolumeEnabled} onChange={() => setGestureVolumeEnabled((v) => !v)} palette={palette} />
+            <SettingRow label="Beat-matched crossfade" sub={currentTrack && bpmMap[currentTrack.id] ? `This track: ~${bpmMap[currentTrack.id]} BPM` : "Blends transitions on the beat"} value={beatMatchCrossfade} onChange={() => setBeatMatchCrossfade((v) => !v)} palette={palette} />
+
+            <div className="text-[11px] tracking-widest mb-1 mt-4" style={{ color: palette.subtext }}>FUN</div>
+            <SheetAction icon={<Wind size={17} />} label="Focus / Meditation mode" sub="Dim UI + breathing guide" onClick={() => { setShowExperienceSheet(false); setFocusModeOpen(true); }} />
+            <div className="text-xs pb-2" style={{ color: palette.subtext }}>Double-tap the album art anytime to like a track ❤️</div>
+          </div>
+        </BottomSheetBackdrop>
+      )}
 
       {contextTrackId && (
         <BottomSheetBackdrop bg={sheetBg} onClose={closeContext}>
@@ -2304,6 +3259,8 @@ export default function MusicPlayer() {
 
             <SettingRow label="Normalize Volume" sub="Even out loud/quiet tracks" value={normalizeVolume} onChange={() => setNormalizeVolume((v) => !v)} palette={palette} />
             <SettingRow label="Smart Continue" sub="Keep playing similar songs when the queue ends" value={smartContinueEnabled} onChange={() => setSmartContinueEnabled((v) => !v)} palette={palette} />
+            <SettingRow label="Shake to Shuffle" sub="Shake your phone to jump into a fresh shuffle" value={shakeToShuffle} onChange={() => (shakeToShuffle ? setShakeToShuffle(false) : enableShakeToShuffle())} palette={palette} />
+            <SettingRow label="Floating Bubble Player" sub="A small draggable bubble instead of the docked mini-player" value={bubbleMode} onChange={() => setBubbleMode((v) => !v)} palette={palette} />
 
             <div className="text-xs mt-5 mb-2" style={{ color: palette.subtext }}>CROSSFADE</div>
             <div className="flex gap-2 mb-1">
@@ -2317,12 +3274,13 @@ export default function MusicPlayer() {
             <button onClick={() => folderInputRef.current?.click()} className="press w-full flex items-center justify-between py-2.5 text-sm">
               <span>Import Folder (auto-playlist)</span><ChevronDown size={15} style={{ transform: "rotate(-90deg)", color: palette.subtext }} />
             </button>
-            <button onClick={exportPlaylists} className="press w-full flex items-center justify-between py-2.5 text-sm">
-              <span>Export Playlists</span><ChevronDown size={15} style={{ transform: "rotate(-90deg)", color: palette.subtext }} />
+            <button onClick={exportPlaylists} aria-label="Export backup" className="press w-full flex items-center justify-between py-2.5 text-sm">
+              <span>Export Backup (playlists, likes, tags, lyrics)</span><ChevronDown size={15} style={{ transform: "rotate(-90deg)", color: palette.subtext }} />
             </button>
-            <button onClick={() => backupInputRef.current?.click()} className="press w-full flex items-center justify-between py-2.5 text-sm">
-              <span>Import Playlists Backup</span><ChevronDown size={15} style={{ transform: "rotate(-90deg)", color: palette.subtext }} />
+            <button onClick={() => backupInputRef.current?.click()} aria-label="Import backup" className="press w-full flex items-center justify-between py-2.5 text-sm">
+              <span>Import Backup</span><ChevronDown size={15} style={{ transform: "rotate(-90deg)", color: palette.subtext }} />
             </button>
+            <div className="text-[11px] mt-1 mb-1" style={{ color: palette.subtext }}>Backs up playlists, liked songs, tags, lyrics and play counts by track name. Audio files stay on this device — re-import the same files first on a new device, then restore the backup.</div>
 
             <div className="text-xs mt-5 mb-2" style={{ color: palette.subtext }}>STORAGE</div>
             {storageEstimate ? (
@@ -2342,7 +3300,10 @@ export default function MusicPlayer() {
         <BottomSheetBackdrop bg={sheetBg} onClose={() => setShowStats(false)}>
           <SheetHandle />
           <div className="px-5 pb-6" style={{ color: palette.text }}>
-            <div className="text-sm font-semibold mb-4">Listening Stats</div>
+            <div className="flex items-center justify-between mb-4">
+              <div className="text-sm font-semibold">Listening Stats</div>
+              <button onClick={shareWrappedCard} className="press flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium" style={{ background: "rgba(250,45,72,0.15)", color: "#FA2D48" }}><Share2 size={13} /> Share Wrapped</button>
+            </div>
             <div className="flex gap-3 mb-5">
               <div className="glass-tile flex-1 rounded-xl p-3" style={{ background: palette.surface }}>
                 <div className="text-2xl font-extrabold">{weeklyPlays.length}</div>
@@ -2401,14 +3362,6 @@ export default function MusicPlayer() {
 }
 
 // =====================================================================
-function ArtBox({ track, className, children }) {
-  return (
-    <div className={`${className} glass-tile`} style={{ background: artGradient(track.name), position: "relative", overflow: "hidden" }}>
-      {track.artUrl && <img src={track.artUrl} alt="" className="absolute inset-0 w-full h-full object-cover" />}
-      {!track.artUrl && children}
-    </div>
-  );
-}
 function QuickTile({ label, icon, onClick, palette, theme }) {
   return (
     <button onClick={onClick} className={`press press-3d glass-tile flex items-center gap-0 rounded-lg overflow-hidden text-left ${theme === "light" ? "glass-light" : ""}`} style={{ height: 56, background: palette.surface }}>
@@ -2478,13 +3431,18 @@ function TrackRow({ t, isCurrent, isPlaying, onTap, onMenu, onSwipeDelete, liked
     if (selectMode) return;
     startX.current = e.touches[0].clientX; startY.current = e.touches[0].clientY;
     dragging.current = false; suppressTap.current = false;
-    if (onMenu) longPressTimer.current = setTimeout(() => { suppressTap.current = true; onMenu(); }, 480);
+    if (onMenu) longPressTimer.current = setTimeout(() => { suppressTap.current = true; haptic(15); onMenu(); }, 480);
   };
   const onTouchMove = (e) => {
     if (selectMode) return;
     const dx = e.touches[0].clientX - startX.current, dy = e.touches[0].clientY - startY.current;
     if (Math.abs(dx) > 8 || Math.abs(dy) > 8) clearTimeout(longPressTimer.current);
-    if (onSwipeDelete && Math.abs(dx) > Math.abs(dy)) { dragging.current = true; setSwipeX(Math.max(-84, Math.min(0, dx))); }
+    if (onSwipeDelete && Math.abs(dx) > Math.abs(dy)) {
+      const wasOpen = swipeX < -50;
+      const next = Math.max(-84, Math.min(0, dx));
+      if ((next <= -50) !== wasOpen) haptic(8);
+      dragging.current = true; setSwipeX(next);
+    }
   };
   const onTouchEnd = () => {
     if (selectMode) return;
@@ -2521,8 +3479,153 @@ function TrackRow({ t, isCurrent, isPlaying, onTap, onMenu, onSwipeDelete, liked
   );
 }
 
+// WOW — album-art particle burst: a quick, playful puff of particles fired
+// from the center of the artwork every time play/pause is tapped.
+function AlbumBurst({ burstKey, accent }) {
+  const particles = useMemo(() => Array.from({ length: 14 }, (_, i) => ({
+    id: i,
+    angle: (i / 14) * 360 + Math.random() * 20,
+    dist: 55 + Math.random() * 55,
+    size: 4 + Math.random() * 5,
+    delay: Math.random() * 0.08,
+  })), [burstKey]);
+  return (
+    <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 6, overflow: "visible" }}>
+      {particles.map((p) => (
+        <div key={p.id} style={{
+          position: "absolute", top: "50%", left: "50%", width: p.size, height: p.size, borderRadius: "50%",
+          background: accent, opacity: 0,
+          "--tx": `${Math.cos((p.angle * Math.PI) / 180) * p.dist}px`,
+          "--ty": `${Math.sin((p.angle * Math.PI) / 180) * p.dist}px`,
+          animation: `burstOut 0.7s ease-out ${p.delay}s forwards`,
+        }} />
+      ))}
+      <style>{`@keyframes burstOut { 0% { transform: translate(-50%,-50%) scale(0.4); opacity: 0.9; } 100% { transform: translate(calc(-50% + var(--tx)), calc(-50% + var(--ty))) scale(1); opacity: 0; } }`}</style>
+    </div>
+  );
+}
+
+// GOD-LEVEL — double-tap-to-like heart burst: one big heart pops from the
+// center while a handful of small hearts scatter outward, Instagram-style.
+function HeartBurst({ burstKey, accent = "#FA2D48" }) {
+  const bits = useMemo(() => Array.from({ length: 8 }, (_, i) => ({
+    id: i,
+    angle: (i / 8) * 360 + Math.random() * 24,
+    dist: 40 + Math.random() * 40,
+    delay: Math.random() * 0.1,
+    size: 12 + Math.random() * 10,
+  })), [burstKey]);
+  return (
+    <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ zIndex: 7 }}>
+      <Heart size={64} color="#fff" fill={accent} className="god-heart-pop" />
+      {bits.map((b) => (
+        <Heart key={b.id} size={b.size} color="#fff" fill={accent} style={{
+          position: "absolute", top: "50%", left: "50%", opacity: 0,
+          "--tx": `${Math.cos((b.angle * Math.PI) / 180) * b.dist}px`,
+          "--ty": `${Math.sin((b.angle * Math.PI) / 180) * b.dist}px`,
+          animation: `heartScatter 0.7s ease-out ${b.delay}s forwards`,
+        }} />
+      ))}
+      <style>{`@keyframes heartScatter { 0% { transform: translate(-50%,-50%) scale(0.4); opacity: 0.9; } 100% { transform: translate(calc(-50% + var(--tx)), calc(-50% + var(--ty))) scale(1); opacity: 0; } }`}</style>
+    </div>
+  );
+}
+
+// GOD-LEVEL — ambient "Live Wallpaper" now-playing screen: a big clock,
+// blurred album art background, and minimal transport controls, styled like
+// something you'd want to cast to a second screen or just let idle on.
+function LiveWallpaper({ track, isPlaying, accent, themeColor, currentTime, duration, onClose, togglePlay, stepTrack }) {
+  const [now, setNow] = useState(new Date());
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 1000 * 15);
+    return () => clearInterval(id);
+  }, []);
+  const timeStr = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const dateStr = now.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+  const progress = duration > 0 ? currentTime / duration : 0;
+  const glow = themeColor ? `rgb(${themeColor.r},${themeColor.g},${themeColor.b})` : accent;
+  return (
+    <div className="fixed inset-0 fade-in" style={{ zIndex: 94, background: "#000" }} onClick={onClose}>
+      {track.artUrl && <img src={track.artUrl} alt="" className="absolute inset-0 w-full h-full object-cover" style={{ filter: "blur(50px) brightness(0.55)", transform: "scale(1.2)" }} />}
+      <div className="absolute inset-0" style={{ background: `radial-gradient(circle at 50% 20%, ${glow}33, transparent 60%)` }} />
+      <div className="relative h-full flex flex-col items-center justify-between py-14 px-6 text-center" onClick={(e) => e.stopPropagation()}>
+        <div>
+          <div className="text-white font-light" style={{ fontSize: 72, lineHeight: 1 }}>{timeStr}</div>
+          <div className="text-white/60 text-sm mt-2">{dateStr}</div>
+        </div>
+        <div className="flex flex-col items-center gap-4 w-full max-w-xs">
+          <ArtBox track={track} className="w-40 h-40 rounded-2xl overflow-hidden shadow-2xl">
+            {!track.artUrl && <div className="w-full h-full flex items-center justify-center"><Disc3 size={44} color="rgba(255,255,255,0.6)" /></div>}
+          </ArtBox>
+          <div className="text-white text-lg font-bold truncate w-full">{track.name}</div>
+          <div className="w-full h-1 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.2)" }}>
+            <div className="h-full" style={{ width: `${progress * 100}%`, background: "#fff" }} />
+          </div>
+          <div className="flex items-center gap-8">
+            <button onClick={() => stepTrack(-1)} className="press"><SkipBack size={22} color="#fff" fill="#fff" /></button>
+            <button onClick={togglePlay} className="press w-14 h-14 rounded-full flex items-center justify-center" style={{ background: "rgba(255,255,255,0.16)" }}>{isPlaying ? <Pause size={22} color="#fff" fill="#fff" /> : <Play size={22} color="#fff" fill="#fff" style={{ marginLeft: 2 }} />}</button>
+            <button onClick={() => stepTrack(1)} className="press"><SkipForward size={22} color="#fff" fill="#fff" /></button>
+          </div>
+        </div>
+        <div className="text-white/40 text-[11px] tracking-widest">TAP ANYWHERE TO CLOSE</div>
+      </div>
+    </div>
+  );
+}
+
+// GOD-LEVEL — cinematic full-screen karaoke. Reuses the app's existing LRC
+// parser but estimates per-word timing (see estimateWordTimings) so words
+// light up one at a time inside the active line, not just the whole line.
+function CinematicKaraoke({ track, lyricsText, currentTime, accent, onClose }) {
+  const parsed = useMemo(() => parseLRC(lyricsText), [lyricsText]);
+  const timedLines = useMemo(() => estimateWordTimings(parsed), [parsed]);
+  const activeIdx = useMemo(() => {
+    if (!timedLines) return -1;
+    let idx = -1;
+    for (let i = 0; i < timedLines.length; i++) { if (timedLines[i].time <= currentTime) idx = i; else break; }
+    return idx;
+  }, [timedLines, currentTime]);
+
+  return (
+    <div className="fixed inset-0 flex flex-col fade-in" style={{ zIndex: 96, background: "#050505" }}>
+      <div className="flex items-center justify-between p-5 shrink-0">
+        <button onClick={onClose} className="press p-2 rounded-full" style={{ background: "rgba(255,255,255,0.12)" }}><ChevronDown size={20} color="#fff" /></button>
+        <div className="text-white/50 text-xs tracking-widest">{track.name}</div>
+        <div style={{ width: 36 }} />
+      </div>
+      {!timedLines ? (
+        <div className="flex-1 flex items-center justify-center text-white/40 text-sm px-10 text-center">
+          {lyricsText ? "This song's lyrics aren't time-synced yet — add sync from the Lyrics tab to unlock cinematic karaoke." : "No lyrics added for this track yet."}
+        </div>
+      ) : (
+        <div className="flex-1 overflow-y-auto flex flex-col items-center justify-center gap-7 px-8 text-center">
+          {timedLines.map((line, i) => {
+            const isActive = i === activeIdx;
+            const isPast = i < activeIdx;
+            return (
+              <div key={i} className="text-2xl font-bold leading-snug transition-all duration-300" style={{
+                color: isActive ? "#fff" : isPast ? "rgba(255,255,255,0.25)" : "rgba(255,255,255,0.35)",
+                transform: isActive ? "scale(1.08)" : "scale(1)",
+              }}>
+                {line.words.map((w, wi) => (
+                  <span key={wi} style={{ color: isActive && currentTime >= w.start ? accent : undefined, marginRight: 8, transition: "color 0.15s linear" }}>{w.word}</span>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BottomSheetBackdrop({ onClose, children, bg }) {
-  return (<><div className="absolute inset-0 fade-in" style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)", zIndex: 80 }} onClick={onClose} /><div className="glass sheet-enter absolute left-0 right-0 bottom-0 rounded-t-3xl pb-8 pt-2" style={{ background: bg || "#1C1C1E", zIndex: 81, maxHeight: "70vh", overflowY: "auto", border: "none", borderTop: "1px solid rgba(255,255,255,0.16)", boxShadow: "0 -16px 40px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.12)" }}>{children}</div></>);
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose?.(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (<><div className="absolute inset-0 fade-in" aria-hidden="true" style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)", zIndex: 80 }} onClick={onClose} /><div role="dialog" aria-modal="true" className="glass sheet-enter absolute left-0 right-0 bottom-0 rounded-t-3xl pb-8 pt-2" style={{ background: bg || "#1C1C1E", zIndex: 81, maxHeight: "70vh", overflowY: "auto", border: "none", borderTop: "1px solid rgba(255,255,255,0.16)", boxShadow: "0 -16px 40px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.12)" }}>{children}</div></>);
 }
 function SheetHandle() { return <div className="w-9 h-1 rounded-full mx-auto mb-3" style={{ background: "rgba(255,255,255,0.25)" }} />; }
 function SheetAction({ icon, label, sub, onClick, danger }) {
@@ -2561,17 +3664,90 @@ function Confetti() {
     </div>
   );
 }
-function LyricsPanel({ track, text, onSave, onBack }) {
-  const [editing, setEditing] = useState(false);
+function LyricsPanel({ track, text, onSave, onBack, currentTime = 0, isPlaying, togglePlay, accent = "#FA2D48" }) {
+  const [mode, setMode] = useState("view"); // view | edit | sync
   const [draft, setDraft] = useState(text);
-  useEffect(() => { setDraft(text); setEditing(false); }, [track?.id]);
+  const [syncIdx, setSyncIdx] = useState(0);
+  const [collected, setCollected] = useState([]);
+  const activeLineRef = useRef(null);
+  useEffect(() => { setDraft(text); setMode("view"); setSyncIdx(0); setCollected([]); }, [track?.id]);
+
+  // WOW — synced/karaoke lyrics: if the saved text has [mm:ss.xx] timestamps,
+  // parse it once and auto-highlight + auto-scroll the current line as the
+  // song plays, like a built-in karaoke display.
+  const parsed = useMemo(() => parseLRC(text), [text]);
+  const activeIdx = useMemo(() => {
+    if (!parsed) return -1;
+    let idx = -1;
+    for (let i = 0; i < parsed.length; i++) { if (parsed[i].time <= currentTime) idx = i; else break; }
+    return idx;
+  }, [parsed, currentTime]);
+  useEffect(() => {
+    activeLineRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [activeIdx]);
+
+  const syncLines = useMemo(() => draft.split("\n").map((l) => l.trim()).filter(Boolean), [draft]);
+
+  const startSync = () => { setCollected([]); setSyncIdx(0); setMode("sync"); if (!isPlaying) togglePlay?.(); };
+  const tagLine = () => {
+    haptic(12);
+    setCollected((prev) => {
+      const next = [...prev, { time: currentTime, text: syncLines[syncIdx] }];
+      if (syncIdx + 1 >= syncLines.length) {
+        const lrc = next.map((l) => `[${fmtLRCTime(l.time)}]${l.text}`).join("\n");
+        onSave(lrc);
+        setMode("view");
+      }
+      return next;
+    });
+    setSyncIdx((i) => i + 1);
+  };
+
+  if (mode === "sync") {
+    return (
+      <div className="flex-1 flex flex-col px-5 overflow-hidden">
+        <div className="flex items-center justify-between py-2">
+          <button onClick={() => setMode("view")} className="press flex items-center gap-1 text-sm font-medium"><ChevronDown size={17} /> Cancel</button>
+          <span className="text-xs tracking-widest" style={{ color: "#98989D" }}>SYNC LYRICS · {syncIdx}/{syncLines.length}</span>
+        </div>
+        <div className="flex-1 flex flex-col items-center justify-center gap-6 text-center">
+          <div className="text-[11px] tracking-wider" style={{ color: "#6E6E73" }}>NOW</div>
+          <div className="text-2xl font-bold leading-snug px-4">{syncLines[syncIdx] || "🎉 All lines tagged!"}</div>
+          {syncLines[syncIdx + 1] && <div className="text-sm" style={{ color: "#6E6E73" }}>{syncLines[syncIdx + 1]}</div>}
+          <div className="flex items-center gap-5 mt-4">
+            <button onClick={() => togglePlay?.()} className="press p-3 rounded-full" style={{ background: "rgba(255,255,255,0.12)" }}>{isPlaying ? <Pause size={20} color="#fff" /> : <Play size={20} color="#fff" />}</button>
+            <button onClick={tagLine} disabled={syncIdx >= syncLines.length} className="press px-8 py-4 rounded-full text-sm font-semibold" style={{ background: accent, color: "#fff", opacity: syncIdx >= syncLines.length ? 0.4 : 1 }}>Tap on this line</button>
+          </div>
+          <div className="text-[11px] mt-2" style={{ color: "#6E6E73" }}>Tap the button the moment each line starts playing</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex-1 flex flex-col px-5 overflow-hidden">
       <div className="flex items-center justify-between py-2">
         <button onClick={onBack} className="press flex items-center gap-1 text-sm font-medium"><ChevronDown size={17} /> Back</button>
-        {!editing ? (<button onClick={() => setEditing(true)} className="press text-sm font-medium" style={{ color: "#FA2D48" }}>{text ? "Edit" : "Add Lyrics"}</button>) : (<button onClick={() => { onSave(draft); setEditing(false); }} className="press text-sm font-medium" style={{ color: "#FA2D48" }}>Save</button>)}
+        <div className="flex items-center gap-4">
+          {mode === "view" && text && !parsed && syncLines.length > 1 && (
+            <button onClick={startSync} className="press flex items-center gap-1 text-sm font-medium" style={{ color: "#FA2D48" }}><Mic2 size={14} /> Sync</button>
+          )}
+          {mode !== "edit" ? (<button onClick={() => setMode("edit")} className="press text-sm font-medium" style={{ color: "#FA2D48" }}>{text ? "Edit" : "Add Lyrics"}</button>) : (<button onClick={() => { onSave(draft); setMode("view"); }} className="press text-sm font-medium" style={{ color: "#FA2D48" }}>Save</button>)}
+        </div>
       </div>
-      {editing ? (<textarea autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Paste or type lyrics here…" className="flex-1 bg-transparent outline-none text-sm leading-relaxed resize-none" style={{ color: "#FFFFFF" }} />) : (<div className="flex-1 overflow-y-auto text-base leading-loose whitespace-pre-wrap" style={{ color: text ? "#FFFFFF" : "#98989D" }}>{text || "No lyrics added yet. Tap \"Add Lyrics\" to write or paste them in."}</div>)}
+      {mode === "edit" ? (
+        <textarea autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Paste or type lyrics here…" className="flex-1 bg-transparent outline-none text-sm leading-relaxed resize-none" style={{ color: "#FFFFFF" }} />
+      ) : parsed ? (
+        <div className="flex-1 overflow-y-auto text-center py-8">
+          {parsed.map((line, i) => (
+            <div key={i} ref={i === activeIdx ? activeLineRef : null} className="py-2.5 text-lg font-semibold transition-all" style={{ color: i === activeIdx ? accent : "rgba(255,255,255,0.35)", transform: i === activeIdx ? "scale(1.05)" : "scale(1)", transition: "color 0.25s, transform 0.25s" }}>
+              {line.text || "♪"}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="flex-1 overflow-y-auto text-base leading-loose whitespace-pre-wrap" style={{ color: text ? "#FFFFFF" : "#98989D" }}>{text || "No lyrics added yet. Tap \"Add Lyrics\" to write or paste them in."}</div>
+      )}
     </div>
   );
 }
